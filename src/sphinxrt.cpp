@@ -1116,6 +1116,7 @@ public:
 public:
 	virtual bool						EarlyReject ( CSphQueryContext * pCtx, CSphMatch & ) const;
 	virtual const CSphSourceStats &		GetStats () const { return m_tStats; }
+	virtual CSphIndexStatus				GetStatus () const;
 
 	virtual bool				MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag, bool bFactors ) const;
 	virtual bool				MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag, bool bFactors ) const;
@@ -1381,6 +1382,9 @@ bool RtIndex_t::AddDocument ( int iFields, const char ** ppFields, const CSphMat
 		return false;
 
 	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizerIndexing->Clone ( false ) ); // avoid race
+	if ( m_tSettings.m_bAotFilter )
+		pTokenizer = sphAotCreateFilter ( pTokenizer.LeakPtr(), m_pDict ); // OPTIMIZE? do not create filter on each(!) INSERT
+
 	CSphSource_StringVector tSrc ( iFields, ppFields, m_tSchema );
 
 	// SPZ setup
@@ -3066,7 +3070,7 @@ void RtIndex_t::SaveDiskDataImpl ( const char * sFilename, const CSphVector<RtSe
 		iTotalDocs += dSegments[i]->m_iAliveRows;
 
 	AttrIndexBuilder_t<DOCID> tMinMaxBuilder ( m_tSchema );
-	CSphVector<DWORD> dMinMaxBuffer ( tMinMaxBuilder.GetExpectedSize ( iTotalDocs ) );
+	CSphVector<DWORD> dMinMaxBuffer ( int ( tMinMaxBuilder.GetExpectedSize ( iTotalDocs ) ) ); // RT index doesn't support over 4Gb .spa
 	tMinMaxBuilder.Prepare ( dMinMaxBuffer.Begin(), dMinMaxBuffer.Begin() + dMinMaxBuffer.GetLength() );
 
 	sName.SetSprintf ( "%s.sps", sFilename );
@@ -3152,7 +3156,7 @@ void RtIndex_t::SaveDiskDataImpl ( const char * sFilename, const CSphVector<RtSe
 
 	tMinMaxBuilder.FinishCollect ();
 	if ( tMinMaxBuilder.GetActualSize() )
-		wrRows.PutBytes ( dMinMaxBuffer.Begin(), sizeof(DWORD) * tMinMaxBuilder.GetActualSize() );
+		wrRows.PutBytes ( dMinMaxBuffer.Begin(), tMinMaxBuilder.GetActualSize()*sizeof(DWORD) );
 
 	tMvaWriter.CloseFile();
 	tStrWriter.CloseFile ();
@@ -3505,7 +3509,7 @@ void RtIndex_t::SaveDiskHeader ( const char * sFilename, DOCID iMinDocID, int iC
 	const CSphSourceStats & tStats, bool bForceID32 ) const
 {
 	static const DWORD INDEX_MAGIC_HEADER	= 0x58485053;	///< my magic 'SPHX' header
-	static const DWORD INDEX_FORMAT_VERSION	= 36;			///< my format version
+	static const DWORD INDEX_FORMAT_VERSION	= 38;			///< my format version
 
 	CSphWriter tWriter;
 	CSphString sName, sError;
@@ -3538,12 +3542,13 @@ void RtIndex_t::SaveDiskHeader ( const char * sFilename, DOCID iMinDocID, int iC
 	tWriter.PutDword ( iInfixCheckpointWordsSize ); // m_iInfixCheckpointWordsSize, v.34+
 
 	// stats
-	tWriter.PutDword ( tStats.m_iTotalDocuments );
+	tWriter.PutDword ( (DWORD)tStats.m_iTotalDocuments ); // FIXME? we don't expect over 4G docs per just 1 local index
 	tWriter.PutOffset ( tStats.m_iTotalBytes );
 
 	// index settings
 	tWriter.PutDword ( m_tSettings.m_iMinPrefixLen );
 	tWriter.PutDword ( m_tSettings.m_iMinInfixLen );
+	tWriter.PutDword ( m_tSettings.m_iMaxSubstringLen );
 	tWriter.PutByte ( m_tSettings.m_bHtmlStrip ? 1 : 0 );
 	tWriter.PutString ( m_tSettings.m_sHtmlIndexAttrs.cstr () );
 	tWriter.PutString ( m_tSettings.m_sHtmlRemoveElements.cstr () );
@@ -3611,7 +3616,7 @@ void RtIndex_t::SaveMeta ( int iDiskChunks, int64_t iTID )
 	wrMeta.PutDword ( META_VERSION );
 	wrMeta.PutDword ( iDiskChunks );
 	wrMeta.PutDword ( m_iDiskBase );
-	wrMeta.PutDword ( m_tStats.m_iTotalDocuments );
+	wrMeta.PutDword ( (DWORD)m_tStats.m_iTotalDocuments ); // FIXME? we don't expect over 4G docs per just 1 local index
 	wrMeta.PutOffset ( m_tStats.m_iTotalBytes ); // FIXME? need PutQword ideally
 	wrMeta.PutOffset ( iTID );
 
@@ -3752,6 +3757,14 @@ bool RtIndex_t::Prealloc ( bool, bool bStripPath, CSphString & )
 		return false;
 	}
 
+	if ( m_tSettings.m_bAotFilter )
+	{
+		CSphString sDictFile;
+		sDictFile.SetSprintf ( "%s/ru.pak", g_sLemmatizerBase.cstr() );
+		if ( !sphAotInitRu ( sDictFile, m_sLastError ) )
+			return false;
+	}
+
 	/////////////
 	// load meta
 	/////////////
@@ -3835,10 +3848,10 @@ bool RtIndex_t::Prealloc ( bool, bool bStripPath, CSphString & )
 
 		// recreate dictionary
 		SafeDelete ( m_pDict );
-		m_pDict = sphCreateDictionaryCRC ( tDictSettings, &tEmbeddedFiles, m_pTokenizer, m_sIndexName.cstr() );
+		m_pDict = sphCreateDictionaryCRC ( tDictSettings, &tEmbeddedFiles, m_pTokenizer, m_sIndexName.cstr(), m_sLastError );
 		if ( !m_pDict )
 		{
-			m_sLastError.SetSprintf ( "index '%s': unable to create dictionary", m_sIndexName.cstr() );
+			m_sLastError.SetSprintf ( "index '%s': %s", m_sIndexName.cstr(), m_sLastError.cstr() );
 			return false;
 		}
 
@@ -3862,8 +3875,9 @@ bool RtIndex_t::Prealloc ( bool, bool bStripPath, CSphString & )
 		int iBloomHashesCount = rdMeta.GetByte();
 		bRebuildInfixes = ( iBloomKeyLen!=BLOOM_PER_ENTRY_VALS_COUNT || iBloomHashesCount!=BLOOM_HASHES_COUNT );
 
-		sphWarning ( "infix definition changed (from len=%d, hashes=%d to len=%d, hashes=%d) - rebuilding...",
-			(int)BLOOM_PER_ENTRY_VALS_COUNT, (int)BLOOM_HASHES_COUNT, iBloomKeyLen, iBloomHashesCount );
+		if ( bRebuildInfixes )
+			sphWarning ( "infix definition changed (from len=%d, hashes=%d to len=%d, hashes=%d) - rebuilding...",
+						(int)BLOOM_PER_ENTRY_VALS_COUNT, (int)BLOOM_HASHES_COUNT, iBloomKeyLen, iBloomHashesCount );
 	}
 
 	///////////////
@@ -5752,7 +5766,7 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 		return false;
 	}
 
-	// transform query if needed (quorum transform, keyword expansion, etc.)
+	// transform query if needed (quorum transform, etc.)
 	sphTransformExtendedQuery ( &tParsed.m_pRoot, m_tSettings, pQuery->m_bSimplify, this );
 
 	// adjust stars in keywords for dict=keywords, enable_star=0 case
@@ -5764,6 +5778,10 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 		tParsed.m_pRoot = sphQueryExpandKeywords ( tParsed.m_pRoot, m_tSettings, m_bEnableStar );
 		tParsed.m_pRoot->Check ( true );
 	}
+
+	// this should be after keyword expansion
+	if ( m_tSettings.m_bAotFilter )
+		TransformAotFilter ( tParsed.m_pRoot, pTokenizer->IsUtf8(), pDict->GetWordforms() );
 
 	// expanding prefix in word dictionary case
 	if ( m_bEnableStar && m_bKeywordDict )
@@ -5892,6 +5910,9 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 
 					tCtx.CalcSort ( tMatch );
 					tCtx.CalcFinal ( tMatch ); // OPTIMIZE? could be possibly done later
+
+					if ( bRandomize )
+						tMatch.m_iWeight = ( sphRand() & 0xffff );
 
 					// storing segment in matches tag for finding strings attrs offset later, biased against default zero
 					tMatch.m_iTag = iSeg+1;
@@ -6681,7 +6702,6 @@ bool RtIndex_t::Truncate ( CSphString & )
 	return true;
 }
 
-
 //////////////////////////////////////////////////////////////////////////
 // OPTIMIZE
 //////////////////////////////////////////////////////////////////////////
@@ -6840,6 +6860,34 @@ void RtIndex_t::Optimize ( volatile bool * pForceTerminate, ThrottleState_t * pT
 
 	sphInfo ( "rt: index %s: optimized chunk(s) %d ( of %d ) in %d.%03d sec",
 		m_sIndexName.cstr(), iChunks-m_pDiskChunks.GetLength(), iChunks, (int)(tmPass/1000000), (int)((tmPass/1000)%1000) );
+}
+
+//////////////////////////////////////////////////////////////////////////
+// STATUS
+//////////////////////////////////////////////////////////////////////////
+
+CSphIndexStatus RtIndex_t::GetStatus () const
+{
+	CSphIndexStatus tRes;
+	Verify ( m_tRwlock.ReadLock() );
+
+	tRes.m_iRamUse = sizeof(RtIndex_t)
+		+ m_pSegments.GetSizeBytes()
+		+ m_pSegments.GetLength()*int(sizeof(RtSegment_t))
+		+ m_dNewSegmentKlist.GetSizeBytes()
+		+ m_dDiskChunkKlist.GetSizeBytes()
+		+ m_pDiskChunks.GetSizeBytes();
+
+	tRes.m_iRamUse += GetUsedRam();
+
+	ARRAY_FOREACH ( i, m_pDiskChunks )
+	{
+		CSphIndexStatus tDisk = m_pDiskChunks[i]->GetStatus();
+		tRes.m_iRamUse += tDisk.m_iRamUse;
+	}
+
+	Verify ( m_tRwlock.Unlock() );
+	return tRes;
 }
 
 //////////////////////////////////////////////////////////////////////////

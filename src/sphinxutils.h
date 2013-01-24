@@ -45,6 +45,13 @@ inline bool sphIsModifier ( int iSymbol )
 }
 
 
+/// all wildcards
+inline bool sphIsWild ( char c )
+{
+	return c=='*' || c=='?' || c=='%';
+}
+
+
 /// string splitter, extracts sequences of alphas (as in sphIsAlpha)
 void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn );
 
@@ -181,7 +188,7 @@ void sphSetLogger ( SphLogger_fn fnLog );
 		#define CRASH_EXIT { signal ( sig, SIG_DFL ); kill ( getpid(), sig ); }
 	#else
 		// UNIX release build, just die
-		#define CRASH_EXIT exit ( 2 )
+		#define CRASH_EXIT { exit ( 2 ); }
 	#endif
 #else
 	#ifndef NDEBUG

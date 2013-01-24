@@ -176,8 +176,8 @@ inline SphDocID_t DOCINFO2ID ( const DWORD * pDocinfo )
 #if PARANOID
 template < typename DOCID > inline DWORD *			DOCINFO2ATTRS_T ( DWORD * pDocinfo )		{ assert ( pDocinfo ); return pDocinfo+DWSIZEOF(DOCID); }
 template < typename DOCID > inline const DWORD *	DOCINFO2ATTRS_T ( const DWORD * pDocinfo )	{ assert ( pDocinfo ); return pDocinfo+DWSIZEOF(DOCID); }
-template < typename DOCID > inline DWORD *			STATIC2DOCINFO_T ( DWORD * pAttrs )		{ assert ( pDocinfo ); return pAttrs-DWSIZEOF(DOCID); }
-template < typename DOCID > inline const DWORD *	STATIC2DOCINFO_T ( const DWORD * pAttrs )	{ assert ( pDocinfo ); return pAttrs-DWSIZEOF(DOCID); }
+template < typename DOCID > inline DWORD *			STATIC2DOCINFO_T ( DWORD * pAttrs )		{ assert ( pAttrs ); return pAttrs-DWSIZEOF(DOCID); }
+template < typename DOCID > inline const DWORD *	STATIC2DOCINFO_T ( const DWORD * pAttrs )	{ assert ( pAttrs ); return pAttrs-DWSIZEOF(DOCID); }
 #else
 template < typename DOCID > inline DWORD *			DOCINFO2ATTRS_T ( DWORD * pDocinfo )		{ return pDocinfo + DWSIZEOF(DOCID); }
 template < typename DOCID > inline const DWORD *	DOCINFO2ATTRS_T ( const DWORD * pDocinfo )	{ return pDocinfo + DWSIZEOF(DOCID); }
@@ -251,8 +251,17 @@ void			sphInterruptNow();
 void			sphSetProcessInfo ( bool bHead );
 #endif
 
-struct CSphIOStats
+
+/// initialize IO statistics collecting
+bool			sphInitIOStats ();
+
+/// clean up IO statistics collector
+void			sphDoneIOStats ();
+
+
+class CSphIOStats
 {
+public:
 	int64_t		m_iReadTime;
 	DWORD		m_iReadOps;
 	int64_t		m_iReadBytes;
@@ -260,22 +269,20 @@ struct CSphIOStats
 	DWORD		m_iWriteOps;
 	int64_t		m_iWriteBytes;
 
-					CSphIOStats ();
+	CSphIOStats ();
+	~CSphIOStats ();
 
-	CSphIOStats		operator + ( const CSphIOStats & tOp ) const;
-	CSphIOStats		operator - ( const CSphIOStats & tOp ) const;
-	CSphIOStats		operator / ( int iOp ) const;
-	CSphIOStats &	operator += ( const CSphIOStats & tOp );
+	void		Start();
+	void		Stop();
+
+	void		Add ( const CSphIOStats & b );
+	bool		IsEnabled() { return m_bEnabled; }
+
+private:
+	bool		m_bEnabled;
+	CSphIOStats * m_pPrev;
 };
 
-/// clear stats, starts collecting
-void				sphStartIOStats ();
-
-/// take a peek at current stats
-const CSphIOStats &	sphPeekIOStats ();
-
-/// stops collecting stats, returns results
-const CSphIOStats &	sphStopIOStats ();
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -673,6 +680,7 @@ struct CSphDictSettings
 	bool			m_bWordDict;
 	bool			m_bCrc32;
 	bool			m_bStopwordsStem;
+	CSphString		m_sMorphFingerprint;		///< not used for creation; only for a check when loading
 
 	CSphDictSettings ()
 		: m_iMinStemmingLen ( 1 )
@@ -697,13 +705,48 @@ struct CSphDictEntry
 	int				m_iDoclistHint;		///< raw document list length hint value (0..255 range, 1 byte)
 };
 
+
+/// stored normal form
+struct CSphStoredNF
+{
+	CSphString					m_sWord;
+	bool						m_bAfterMorphology;
+};
+
+
+/// wordforms container
+struct CSphWordforms
+{
+	int							m_iRefCount;
+	CSphVector<CSphSavedFile>	m_dFiles;
+	uint64_t					m_uTokenizerFNV;
+	CSphString					m_sIndexName;
+	bool						m_bHavePostMorphNF;
+	CSphVector <CSphStoredNF>	m_dNormalForms;
+	CSphMultiformContainer *	m_pMultiWordforms;
+	CSphOrderedHash < int, CSphString, CSphStrHashFunc, 1048576 >	m_dHash;
+
+	CSphWordforms ();
+	~CSphWordforms ();
+
+	bool						IsEqual ( const CSphVector<CSphSavedFile> & dFiles );
+	bool						ToNormalForm ( BYTE * pWord, bool bBefore ) const;
+};
+
+
 /// abstract word dictionary interface
 struct CSphWordHit;
 class CSphAutofile;
 struct DictHeader_t;
 struct ThrottleState_t;
-struct CSphDict
+class CSphDict
 {
+public:
+	static const int	ST_OK = 0;
+	static const int	ST_ERROR = 1;
+	static const int	ST_WARNING = 2;
+
+public:
 	/// virtualizing dtor
 	virtual				~CSphDict () {}
 
@@ -735,7 +778,7 @@ struct CSphDict
 	virtual void		ApplyStemmers ( BYTE * ) {}
 
 	/// load stopwords from given files
-	virtual void		LoadStopwords ( const char * sFiles, ISphTokenizer * pTokenizer ) = 0;
+	virtual void		LoadStopwords ( const char * sFiles, const ISphTokenizer * pTokenizer ) = 0;
 
 	/// load stopwords from an array
 	virtual void		LoadStopwords ( const CSphVector<SphWordID_t> & dStopwords ) = 0;
@@ -744,15 +787,26 @@ struct CSphDict
 	virtual void		WriteStopwords ( CSphWriter & tWriter ) = 0;
 
 	/// load wordforms from a given list of files
-	virtual bool		LoadWordforms ( const CSphVector<CSphString> &, const CSphEmbeddedFiles * pEmbedded, ISphTokenizer * pTokenizer, const char * sIndex ) = 0;
+	virtual bool		LoadWordforms ( const CSphVector<CSphString> &, const CSphEmbeddedFiles * pEmbedded, const ISphTokenizer * pTokenizer, const char * sIndex ) = 0;
 
 	/// write wordforms to a file
 	virtual void		WriteWordforms ( CSphWriter & tWriter ) = 0;
 
-	/// set morphology
-	virtual bool		SetMorphology ( const char * szMorph, bool bUseUTF8 ) = 0;
+	/// get wordforms
+	virtual const CSphWordforms *	GetWordforms() { return NULL; }
 
+	/// disable wordforms processing
+	virtual void		DisableWordforms() {}
+
+	/// set morphology
+	/// returns 0 on success, 1 on hard error, 2 on a warning (see ST_xxx constants)
+	virtual int			SetMorphology ( const char * szMorph, bool bUseUTF8, CSphString & sMessage ) = 0;
+
+	/// are there any morphological processors?
 	virtual bool		HasMorphology () const { return false; }
+
+	/// morphological data fingerprint (lemmatizer filenames and crc32s)
+	virtual const CSphString &	GetMorphDataFingerprint () const { return m_sMorphFingerprint; }
 
 	/// setup dictionary using settings
 	virtual void		Setup ( const CSphDictSettings & tSettings ) = 0;
@@ -810,14 +864,17 @@ public:
 
 	/// make a clone
 	virtual CSphDict *		Clone () const { return NULL; }
+
+protected:
+	CSphString				m_sMorphFingerprint;
 };
 
 
 /// CRC32/FNV64 dictionary factory
-CSphDict * sphCreateDictionaryCRC ( const CSphDictSettings & tSettings, const CSphEmbeddedFiles * pFiles, ISphTokenizer * pTokenizer, const char * sIndex );
+CSphDict * sphCreateDictionaryCRC ( const CSphDictSettings & tSettings, const CSphEmbeddedFiles * pFiles, const ISphTokenizer * pTokenizer, const char * sIndex, CSphString & sError );
 
 /// keyword-storing dictionary factory
-CSphDict * sphCreateDictionaryKeywords ( const CSphDictSettings & tSettings, const CSphEmbeddedFiles * pFiles, ISphTokenizer * pTokenizer, const char * sIndex );
+CSphDict * sphCreateDictionaryKeywords ( const CSphDictSettings & tSettings, const CSphEmbeddedFiles * pFiles, ISphTokenizer * pTokenizer, const char * sIndex, CSphString & sError );
 
 /// clear wordform cache
 void sphShutdownWordforms ();
@@ -1281,22 +1338,7 @@ struct CSphColumnInfo
 	bool							m_bWeight;		///< is a weight column
 
 	/// handy ctor
-	CSphColumnInfo ( const char * sName=NULL, ESphAttr eType=SPH_ATTR_NONE )
-		: m_sName ( sName )
-		, m_eAttrType ( eType )
-		, m_eWordpart ( SPH_WORDPART_WHOLE )
-		, m_bIndexed ( false )
-		, m_iIndex ( -1 )
-		, m_eSrc ( SPH_ATTRSRC_NONE )
-		, m_pExpr ( NULL )
-		, m_eAggrFunc ( SPH_AGGR_NONE )
-		, m_eStage ( SPH_EVAL_STATIC )
-		, m_bPayload ( false )
-		, m_bFilename ( false )
-		, m_bWeight ( false )
-	{
-		m_sName.ToLower ();
-	}
+	CSphColumnInfo ( const char * sName=NULL, ESphAttr eType=SPH_ATTR_NONE );
 
 	/// equality comparison checks name, type, and locator
 	bool operator == ( const CSphColumnInfo & rhs ) const
@@ -1463,6 +1505,7 @@ struct CSphSourceSettings
 {
 	int		m_iMinPrefixLen;	///< min indexable prefix (0 means don't index prefixes)
 	int		m_iMinInfixLen;		///< min indexable infix length (0 means don't index infixes)
+	int		m_iMaxSubstringLen;	///< max indexable infix and prefix (0 means don't limit infixes and prefixes)
 	int		m_iBoundaryStep;	///< additional boundary word position increment
 	bool	m_bIndexExactWords;	///< exact (non-stemmed) word indexing flag
 	int		m_iOvershortStep;	///< position step on overshort token (default is 1)
@@ -2364,6 +2407,7 @@ public:
 	bool			m_bZSlist;		///< whether the ranker has to fetch the zonespanlist with this query
 	bool			m_bSimplify;	///< whether to apply boolean simplification
 	bool			m_bPlainIDF;	///< whether to use PlainIDF=log(N/n) or NormalizedIDF=log((N-n+1)/n)
+	bool			m_bGlobalIDF;	///< whether to use local indexes or a global idf file
 
 	CSphVector<CSphFilterSettings>	m_dFilters;	///< filters
 
@@ -2402,6 +2446,7 @@ public:
 
 	bool			m_bReverseScan;		///< perform scan in reverse order
 	bool			m_bIgnoreNonexistent; ///< whether to warning or not about non-existent columns in select list
+	bool			m_bIgnoreNonexistentIndexes; ///< whether to error or not about non-existent indexes in index list
 
 	int				m_iSQLSelectStart;	///< SQL parser helper
 	int				m_iSQLSelectEnd;	///< SQL parser helper
@@ -2791,13 +2836,15 @@ struct CSphIndexSettings : public CSphSourceSettings
 	CSphString		m_sHtmlRemoveElements;
 	CSphString		m_sZones;
 	ESphHitless		m_eHitless;
-	CSphString		m_sHitlessFile;
+	CSphString		m_sHitlessFiles;
 	bool			m_bVerbose;
 	int				m_iEmbeddedLimit;
 
 	ESphBigram				m_eBigramIndex;
 	CSphString				m_sBigramWords;
 	CSphVector<CSphString>	m_dBigramWords;
+
+	bool			m_bAotFilter;	///< lemmatize_ru_all forces us to transform queries on the index level too
 
 					CSphIndexSettings ();
 };
@@ -2812,8 +2859,14 @@ struct ISphFilter;
 
 struct ISphKeywordsStat
 {
-	virtual ~ISphKeywordsStat() {}
-	virtual bool FillKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, CSphString & sError ) const = 0;
+	virtual			~ISphKeywordsStat() {}
+	virtual bool	FillKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, CSphString & sError ) const = 0;
+};
+
+
+struct CSphIndexStatus
+{
+	int64_t			m_iRamUse;
 };
 
 
@@ -2842,7 +2895,7 @@ public:
 	virtual void				SetWordlistPreload ( bool bValue ) { m_bPreloadWordlist = bValue; }
 	void						SetFieldFilter ( ISphFieldFilter * pFilter );
 	void						SetTokenizer ( ISphTokenizer * pTokenizer );
-	ISphTokenizer *				GetTokenizer () const { return m_pTokenizer; }
+	const ISphTokenizer *		GetTokenizer () const { return m_pTokenizer; }
 	ISphTokenizer *				LeakTokenizer ();
 	void						SetDictionary ( CSphDict * pDict );
 	CSphDict *					GetDictionary () const { return m_pDict; }
@@ -2897,8 +2950,14 @@ public:
 	virtual void				PostSetup() = 0;
 
 public:
-	virtual bool						EarlyReject ( CSphQueryContext * pCtx, CSphMatch & tMatch ) const = 0;
+	/// return index document, bytes totals (FIXME? remove this in favor of GetStatus() maybe?)
 	virtual const CSphSourceStats &		GetStats () const = 0;
+
+	/// return additional index info
+	virtual CSphIndexStatus				GetStatus () const = 0;
+
+public:
+	virtual bool				EarlyReject ( CSphQueryContext * pCtx, CSphMatch & tMatch ) const = 0;
 	void						SetCacheSize ( int iMaxCachedDocs, int iMaxCachedHits );
 	virtual bool				MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag=0, bool bFactors = false ) const = 0;
 	virtual bool				MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag=0, bool bFactors = false ) const = 0;
@@ -2979,6 +3038,13 @@ protected:
 	int							m_iMaxCachedHits;
 	CSphString					m_sIndexName;
 	CSphString					m_sFilename;
+
+public:
+	float						GetGlobalIDF ( const CSphString & sWord, int iDocsLocal, int iQwords, bool bPlainIDF ) const;
+	void						SetGlobalIDFPath ( const char * sPath ) { m_sGlobalIDFPath = sPath; }
+
+protected:
+	CSphString					m_sGlobalIDFPath;
 };
 
 // update attributes with index pointer attached
@@ -3034,6 +3100,10 @@ bool				sphHasExpressions ( const CSphQuery & tQuery, const CSphSchema & tSchema
 
 /// initialize collation tables
 void				sphCollationInit ();
+
+//////////////////////////////////////////////////////////////////////////
+
+extern CSphString g_sLemmatizerBase;
 
 /////////////////////////////////////////////////////////////////////////////
 

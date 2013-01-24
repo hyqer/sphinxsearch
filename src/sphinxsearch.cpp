@@ -1244,7 +1244,9 @@ static ISphQword * CreateQueryWord ( const XQKeyword_t & tWord, const ISphQwordS
 
 	ISphQword * pWord = tSetup.QwordSpawn ( tWord );
 	pWord->m_sWord = tWord.m_sWord;
-	pWord->m_iWordID = tSetup.m_pDict->GetWordID ( sTmp );
+	pWord->m_iWordID = tWord.m_bMorphed
+		? tSetup.m_pDict->GetWordIDNonStemmed ( sTmp )
+		: tSetup.m_pDict->GetWordID ( sTmp );
 	pWord->m_sDictWord = (char*)sTmp;
 	pWord->m_bExpanded = tWord.m_bExpanded;
 	tSetup.QwordSetup ( pWord );
@@ -3911,7 +3913,7 @@ inline bool FSMmultinear::HitFSM ( const ExtHit_t* pHit, ExtHit_t* dTarget )
 
 //////////////////////////////////////////////////////////////////////////
 
-ExtQuorum_c::ExtQuorum_c ( CSphVector<ExtNode_i*> & dQwords, const XQNode_t & tNode, const ISphQwordSetup & )
+ExtQuorum_c::ExtQuorum_c ( CSphVector<ExtNode_i*> & dQwords, const XQNode_t & tNode, const ISphQwordSetup & tSetup )
 {
 	assert ( tNode.GetOp()==SPH_QUERY_QUORUM );
 
@@ -3944,6 +3946,8 @@ ExtQuorum_c::ExtQuorum_c ( CSphVector<ExtNode_i*> & dQwords, const XQNode_t & tN
 	m_bmMask = m_bmInitialMask = bmDupes;
 	m_iMaskEnd = dQwords.GetLength() - 1;
 	m_uMatchedDocid = 0;
+
+	AllocDocinfo ( tSetup );
 }
 
 ExtQuorum_c::~ExtQuorum_c ()
@@ -4232,12 +4236,16 @@ int ExtOrder_c::GetNextHit ( SphDocID_t uDocid )
 			continue;
 
 		// skip until proper hit
-		while ( m_pHits[i]->m_uDocid < uDocid )
+		while ( m_pHits[i]->m_uDocid!=DOCID_MAX && m_pHits[i]->m_uDocid<uDocid )
 			m_pHits[i]++;
 
 		// hit-chunk over? request next one, and rescan
 		if ( m_pHits[i]->m_uDocid==DOCID_MAX )
 		{
+			// hits and docs over here
+			if ( !m_pDocsChunk[i] )
+				return -1;
+
 			m_pHits[i] = m_dChildren[i]->GetHitsChunk ( m_pDocsChunk[i], m_dMaxID[i] );
 			i--;
 			continue;
@@ -6382,7 +6390,7 @@ bool RankerState_Expr_fn<true>::ExtraDataImpl ( ExtraData_e eType, void ** ppRes
 				m_tFactorPool.Release ( dReleased[i] );
 		}
 		return true;
-	case EXTRA_GET_DATA_RANKFACTORS:
+	case EXTRA_GET_DATA_PACKEDFACTORS:
 		*ppResult = m_tFactorPool.GetHashPtr();
 		return true;
 	default:
@@ -7158,7 +7166,7 @@ BYTE * RankerState_Expr_fn<NEED_PACKEDFACTORS>::PackFactors ( int * pSize )
 
 	// document level factors
 	*pPack++ = m_uDocBM25;
-	*pPack++ = (DWORD)m_fDocBM25A;
+	*pPack++ = *(DWORD*)&m_fDocBM25A;
 	*pPack++ = m_uMatchedFields;
 	*pPack++ = m_uDocWordCount;
 
@@ -7175,10 +7183,10 @@ BYTE * RankerState_Expr_fn<NEED_PACKEDFACTORS>::PackFactors ( int * pSize )
 			*pPack++ = (DWORD)i;
 			*pPack++ = m_uLCS[i];
 			*pPack++ = m_uWordCount[i];
-			*pPack++ = (DWORD)m_dTFIDF[i];
-			*pPack++ = (DWORD)m_dMinIDF[i];
-			*pPack++ = (DWORD)m_dMaxIDF[i];
-			*pPack++ = (DWORD)m_dSumIDF[i];
+			*pPack++ = *(DWORD*)&m_dTFIDF[i];
+			*pPack++ = *(DWORD*)&m_dMinIDF[i];
+			*pPack++ = *(DWORD*)&m_dMaxIDF[i];
+			*pPack++ = *(DWORD*)&m_dSumIDF[i];
 			*pPack++ = (DWORD)m_iMinHitPos[i];
 			*pPack++ = (DWORD)m_iMinBestSpanPos[i];
 			*pPack++ = ( m_uExactHit>>i ) & 1;
@@ -7196,7 +7204,7 @@ BYTE * RankerState_Expr_fn<NEED_PACKEDFACTORS>::PackFactors ( int * pSize )
 		{
 			*pPack++ = (DWORD)i;
 			*pPack++ = (DWORD)m_dTF[i];
-			*pPack++ = (DWORD)m_dIDF[i];
+			*pPack++ = *(DWORD*)&m_dIDF[i];
 		}
 	}
 
@@ -7333,7 +7341,7 @@ public:
 			if ( dVal.GetLength() < iTotalLen+1 )
 				dVal.Resize ( iTotalLen+1 );
 
-			strcpy ( &(dVal[iValLen]), sTmp );
+			strcpy ( &(dVal[iValLen]), sTmp ); //NOLINT
 		}
 
 		// build word level factors
@@ -7346,7 +7354,7 @@ public:
 			if ( dVal.GetLength() < iTotalLen+1 )
 				dVal.Resize ( iTotalLen+1 );
 
-			strcpy ( &(dVal[iValLen]), sTmp );
+			strcpy ( &(dVal[iValLen]), sTmp ); //NOLINT
 		}
 
 		// export factors
@@ -7536,11 +7544,14 @@ ISphRanker * sphCreateRanker ( const XQQuery_t & tXQ, const CSphQuery * pQuery, 
 
 		// build IDF
 		float fIDF = 0.0f;
-		if ( tWord.m_iDocs )
+		if ( pQuery->m_bGlobalIDF )
+			fIDF = pIndex->GetGlobalIDF ( tWord.m_sWord, tWord.m_iDocs, iQwords, pQuery->m_bPlainIDF );
+		else if ( tWord.m_iDocs )
 		{
 			// (word_docs > total_docs) case *is* occasionally possible
 			// because of dupes, or delayed purging in RT, etc
-			const int iTotalClamped = Max ( tSourceStats.m_iTotalDocuments, tWord.m_iDocs );
+			// FIXME? we don't expect over 4G docs per just 1 local index
+			const int64_t iTotalClamped = Max ( tSourceStats.m_iTotalDocuments, int64_t(tWord.m_iDocs) );
 
 			if ( !pQuery->m_bPlainIDF )
 			{

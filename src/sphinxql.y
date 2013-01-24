@@ -167,11 +167,9 @@ multi_stmt:
 select:
 	select_from
 	| TOK_SELECT select_items_list TOK_FROM '(' subselect_start select_from ')'
-		TOK_ORDER TOK_BY order_items_list opt_outer_limit
+		opt_outer_order opt_outer_limit
 		{
 			assert ( pParser->m_pStmt->m_eStmt==STMT_SELECT ); // set by subselect
-			pParser->m_pQuery->m_sOuterOrderBy.SetBinary ( pParser->m_pBuf+$10.m_iStart,
-				$10.m_iEnd-$10.m_iStart );
 		}
 	;
 
@@ -187,7 +185,21 @@ subselect_start:
 		pParser->ResetSelect();
 	};
 
+
+opt_outer_order:
+	// nothing
+		{
+			pParser->m_pQuery->m_sOuterOrderBy = pParser->m_pQuery->m_sOrderBy;
+		}
+	| TOK_ORDER TOK_BY order_items_list
+		{
+			pParser->m_pQuery->m_sOuterOrderBy.SetBinary ( pParser->m_pBuf+$3.m_iStart,
+				$3.m_iEnd-$3.m_iStart );
+		}
+	;
+
 opt_outer_limit:
+	// nothing
 	| TOK_LIMIT TOK_CONST_INT
 		{
 			pParser->m_pQuery->m_iOuterLimit = $2.m_iValue;
@@ -466,6 +478,11 @@ opt_group_order_clause:
 group_order_clause:
 	TOK_WITHIN TOK_GROUP TOK_ORDER TOK_BY order_items_list
 		{
+			if ( pParser->m_pQuery->m_sGroupBy.IsEmpty() )
+			{
+				yyerror ( pParser, "you must specify GROUP BY element in order to use WITHIN GROUP ORDER BY clause" );
+				YYERROR;
+			}
 			pParser->m_pQuery->m_sSortBy.SetBinary ( pParser->m_pBuf+$5.m_iStart, $5.m_iEnd-$5.m_iStart );
 		}
 	;
@@ -642,22 +659,27 @@ show_stmt:
 
 like_filter:
 	// empty
-	| TOK_LIKE TOK_QUOTED_STRING { pParser->m_pStmt->m_sStringParam = $2.m_sValue; }
+	| TOK_LIKE TOK_QUOTED_STRING		{ pParser->m_pStmt->m_sStringParam = $2.m_sValue; }
 	;
 
 show_what:
-	TOK_WARNINGS		{ pParser->m_pStmt->m_eStmt = STMT_SHOW_WARNINGS; }
-	| TOK_STATUS like_filter		{ pParser->m_pStmt->m_eStmt = STMT_SHOW_STATUS; }
-	| TOK_META like_filter			{ pParser->m_pStmt->m_eStmt = STMT_SHOW_META; }
-	| TOK_AGENT TOK_STATUS like_filter	{ pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENTSTATUS; }
+	TOK_WARNINGS						{ pParser->m_pStmt->m_eStmt = STMT_SHOW_WARNINGS; }
+	| TOK_STATUS like_filter			{ pParser->m_pStmt->m_eStmt = STMT_SHOW_STATUS; }
+	| TOK_META like_filter				{ pParser->m_pStmt->m_eStmt = STMT_SHOW_META; }
+	| TOK_AGENT TOK_STATUS like_filter	{ pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS; }
 	| TOK_AGENT TOK_QUOTED_STRING TOK_STATUS like_filter
 		{
-			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENTSTATUS;
+			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS;
 			pParser->m_pStmt->m_sIndex = $2.m_sValue;
 		}
 	| TOK_AGENT TOK_IDENT TOK_STATUS like_filter
 		{
-			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENTSTATUS;
+			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS;
+			pParser->m_pStmt->m_sIndex = $2.m_sValue;
+		}
+	| TOK_INDEX TOK_IDENT TOK_STATUS
+		{
+			pParser->m_pStmt->m_eStmt = STMT_SHOW_INDEX_STATUS;
 			pParser->m_pStmt->m_sIndex = $2.m_sValue;
 		}
 	;
@@ -1073,7 +1095,7 @@ sysvar_name:
 		}
 	;
 
-////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
 
 truncate:
 	TOK_TRUNCATE TOK_RTINDEX TOK_IDENT
@@ -1084,7 +1106,7 @@ truncate:
 		}
 	;
 
-////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
 
 optimize_index:
 	TOK_OPTIMIZE TOK_INDEX TOK_IDENT

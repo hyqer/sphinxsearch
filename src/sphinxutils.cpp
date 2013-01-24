@@ -90,12 +90,6 @@ void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn )
 }
 
 
-static inline bool IsWild ( char c )
-{
-	return c=='*' || c=='?' || c=='%';
-}
-
-
 bool sphWildcardMatch ( const char * sString, const char * sPattern )
 {
 	if ( !sString || !sPattern )
@@ -107,6 +101,13 @@ bool sphWildcardMatch ( const char * sString, const char * sPattern )
 	{
 		switch ( *p )
 		{
+		case '\\':
+			// escaped char, strict match the next one literally
+			p++;
+			if ( *s++!=*p++ )
+				return false;
+			break;
+
 		case '?':
 			// match any character
 			s++;
@@ -123,7 +124,7 @@ bool sphWildcardMatch ( const char * sString, const char * sPattern )
 				break;
 
 			// plain char after a hash? check the non-ambiguous cases
-			if ( !IsWild(*p) )
+			if ( !sphIsWild(*p) )
 			{
 				if ( s[0]!=*p )
 				{
@@ -356,6 +357,7 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "ignore_chars",			0, NULL },
 	{ "min_prefix_len",			0, NULL },
 	{ "min_infix_len",			0, NULL },
+	{ "max_substring_len",		0, NULL },
 	{ "prefix_fields",			0, NULL },
 	{ "infix_fields",			0, NULL },
 	{ "enable_star",			0, NULL },
@@ -387,7 +389,7 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "stopword_step",			0, NULL },
 	{ "blend_chars",			0, NULL },
 	{ "expand_keywords",		0, NULL },
-	{ "hitless_words",			KEY_LIST, NULL },
+	{ "hitless_words",			0, NULL },
 	{ "hit_format",				0, NULL },
 	{ "rt_field",				KEY_LIST, NULL },
 	{ "rt_attr_uint",			KEY_LIST, NULL },
@@ -408,6 +410,7 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "index_field_lengths",	0, NULL },
 	{ "divide_remote_ranges",	0, NULL },
 	{ "stopwords_stem",			0, NULL },
+	{ "global_idf",				0, NULL },
 	{ NULL,						0, NULL }
 };
 
@@ -424,6 +427,8 @@ static KeyDesc_t g_dKeysIndexer[] =
 	{ "on_json_attr_error",		0, NULL },
 	{ "json_autoconv_numbers",	0, NULL },
 	{ "json_autoconv_keynames",	0, NULL },
+	{ "lemmatizer_base",		0, NULL },
+	{ "lemmatizer_cache",		0, NULL },
 	{ NULL,						0, NULL }
 };
 
@@ -1047,7 +1052,7 @@ bool sphConfTokenizer ( const CSphConfigSection & hIndex, CSphTokenizerSettings 
 	}
 
 	tSettings.m_sCaseFolding = hIndex.GetStr ( "charset_table" );
-	tSettings.m_iMinWordLen = Max ( hIndex.GetInt ( "min_word_len" ), 0 );
+	tSettings.m_iMinWordLen = Max ( hIndex.GetInt ( "min_word_len", 1 ), 1 );
 	tSettings.m_sNgramChars = hIndex.GetStr ( "ngram_chars" );
 	tSettings.m_sSynonymsFile = hIndex.GetStr ( "exceptions" ); // new option name
 	if ( tSettings.m_sSynonymsFile.IsEmpty() )
@@ -1130,20 +1135,11 @@ void sphConfDictionary ( const CSphConfigSection & hIndex, CSphDictSettings & tS
 
 		globfree ( &tGlob );
 #endif
-		dFilesFound.Sort();
+
+		dFilesFound.Uniq();
 		ARRAY_FOREACH ( i, dFilesFound )
 			tSettings.m_dWordforms.Add ( dFilesFound[i] );
 	}
-
-	// remove duplicate wordform files
-	for ( int i = tSettings.m_dWordforms.GetLength()-1; i>=0; i-- )
-		for ( int j = i-1; j>=0; j-- )
-			if ( tSettings.m_dWordforms[i]==tSettings.m_dWordforms[j] )
-			{
-				fprintf ( stdout, "WARNING: duplicate wordform file found '%s' : ignoring\n", tSettings.m_dWordforms[i].cstr() );
-				tSettings.m_dWordforms.Remove(j);
-				i--;
-			}
 
 	if ( hIndex("dict") )
 	{
@@ -1180,6 +1176,7 @@ bool sphConfIndex ( const CSphConfigSection & hIndex, CSphIndexSettings & tSetti
 	// misc settings
 	tSettings.m_iMinPrefixLen = Max ( hIndex.GetInt ( "min_prefix_len" ), 0 );
 	tSettings.m_iMinInfixLen = Max ( hIndex.GetInt ( "min_infix_len" ), 0 );
+	tSettings.m_iMaxSubstringLen = Max ( hIndex.GetInt ( "max_substring_len" ), 0 );
 	tSettings.m_iBoundaryStep = Max ( hIndex.GetInt ( "phrase_boundary_step" ), -1 );
 	tSettings.m_bIndexExactWords = hIndex.GetInt ( "index_exact_words" )!=0;
 	tSettings.m_iOvershortStep = Min ( Max ( hIndex.GetInt ( "overshort_step", 1 ), 0 ), 1 );
@@ -1228,10 +1225,28 @@ bool sphConfIndex ( const CSphConfigSection & hIndex, CSphIndexSettings & tSetti
 		return false;
 	}
 
+	if ( tSettings.m_iMaxSubstringLen && tSettings.m_iMaxSubstringLen<tSettings.m_iMinInfixLen )
+	{
+		sError.SetSprintf ( "max_substring_len=%d is less than min_infix_len=%d", tSettings.m_iMaxSubstringLen, tSettings.m_iMinInfixLen );
+		return false;
+	}
+
+	if ( tSettings.m_iMaxSubstringLen && tSettings.m_iMaxSubstringLen<tSettings.m_iMinPrefixLen )
+	{
+		sError.SetSprintf ( "max_substring_len=%d is less than min_prefix_len=%d", tSettings.m_iMaxSubstringLen, tSettings.m_iMinPrefixLen );
+		return false;
+	}
+
 	bool bWordDict = ( strcmp ( hIndex.GetStr ( "dict", "" ), "keywords" )==0 );
 	if ( hIndex("type") && hIndex["type"]=="rt" && ( tSettings.m_iMinInfixLen>0 || tSettings.m_iMinPrefixLen>0 ) && !bWordDict )
 	{
 		sError.SetSprintf ( "RT indexes support prefixes and infixes with only dict=keywords" );
+		return false;
+	}
+
+	if ( bWordDict && tSettings.m_iMaxSubstringLen>0 )
+	{
+		sError.SetSprintf ( "max_substring_len can not be used with dict=keywords" );
 		return false;
 	}
 
@@ -1268,17 +1283,14 @@ bool sphConfIndex ( const CSphConfigSection & hIndex, CSphIndexSettings & tSetti
 	// hit-less indices
 	if ( hIndex("hitless_words") )
 	{
-		for ( const CSphVariant * pVariant = &hIndex["hitless_words"]; pVariant; pVariant = pVariant->m_pNext )
+		const CSphString & sValue = hIndex["hitless_words"];
+		if ( sValue=="all" )
 		{
-			const CSphString & sValue = *pVariant;
-			if ( sValue=="all" )
-			{
-				tSettings.m_eHitless = SPH_HITLESS_ALL;
-			} else
-			{
-				tSettings.m_eHitless = SPH_HITLESS_SOME;
-				tSettings.m_sHitlessFile = sValue;
-			}
+			tSettings.m_eHitless = SPH_HITLESS_ALL;
+		} else
+		{
+			tSettings.m_eHitless = SPH_HITLESS_SOME;
+			tSettings.m_sHitlessFiles = sValue;
 		}
 	}
 
@@ -1316,6 +1328,12 @@ bool sphConfIndex ( const CSphConfigSection & hIndex, CSphIndexSettings & tSetti
 		return false;
 	}
 
+	// aot
+	CSphVector<CSphString> dMorphs;
+	sphSplit ( dMorphs, hIndex.GetStr ( "morphology" ) );
+
+	tSettings.m_bAotFilter = ARRAY_ANY ( tSettings.m_bAotFilter, dMorphs, dMorphs[_any]=="lemmatize_ru_all" );
+
 	// all good
 	return true;
 }
@@ -1345,10 +1363,10 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 		if ( pIndex->m_bId32to64 )
 			tSettings.m_bCrc32 = true;
 		sphConfDictionary ( hIndex, tSettings );
-		CSphDict * pDict = sphCreateDictionaryCRC ( tSettings, NULL, pIndex->GetTokenizer (), pIndex->GetName() );
+		CSphDict * pDict = sphCreateDictionaryCRC ( tSettings, NULL, pIndex->GetTokenizer (), pIndex->GetName(), sError );
 		if ( !pDict )
 		{
-			sphWarning ( "index '%s': unable to create dictionary", pIndex->GetName() );
+			sphWarning ( "index '%s': %s", pIndex->GetName(), sError.cstr() );
 			return false;
 		}
 
@@ -1834,7 +1852,7 @@ void sphBacktrace ( int iFD, bool bSafe )
 
 	while ( pMyStack && !bSafe )
 	{
-		sphSafeInfo ( iFD, "begin of manual backtrace:" );
+		sphSafeInfo ( iFD, "Trying manual backtrace:" );
 		BYTE ** pFramePointer = NULL;
 
 		int iFrameCount = 0;
@@ -1856,7 +1874,7 @@ void sphBacktrace ( int iFD, bool bSafe )
 
 		if ( !pFramePointer )
 		{
-			sphSafeInfo ( iFD, "Frame pointer is null, backtrace failed (did you build with -fomit-frame-pointer?)" );
+			sphSafeInfo ( iFD, "Frame pointer is null, manual backtrace failed (did you build with -fomit-frame-pointer?)" );
 			break;
 		}
 
@@ -1864,11 +1882,11 @@ void sphBacktrace ( int iFD, bool bSafe )
 		{
 			int iRound = Min ( 65536, iStackSize );
 			pMyStack = (void *) ( ( (size_t) &pFramePointer + iRound ) & ~(size_t)65535 );
-			sphSafeInfo ( iFD, "Something wrong with thread stack, backtrace may be incorrect (fp=0x%p)", pFramePointer );
+			sphSafeInfo ( iFD, "Something wrong with thread stack, manual backtrace may be incorrect (fp=0x%p)", pFramePointer );
 
 			if ( pFramePointer > (BYTE**) pMyStack || pFramePointer < (BYTE**) pMyStack - iStackSize )
 			{
-				sphSafeInfo ( iFD, "Wrong stack limit or frame pointer, backtrace failed (fp=0x%p, stack=0x%p, stacksize=0x%x)",
+				sphSafeInfo ( iFD, "Wrong stack limit or frame pointer, manual backtrace failed (fp=0x%p, stack=0x%p, stacksize=0x%x)",
 					pFramePointer, pMyStack, iStackSize );
 				break;
 			}
@@ -1890,15 +1908,17 @@ void sphBacktrace ( int iFD, bool bSafe )
 		}
 
 		if ( !bOk )
-			sphSafeInfo ( iFD, "Something wrong in frame pointers, backtrace failed (fp=%p)", pNewFP );
+			sphSafeInfo ( iFD, "Something wrong in frame pointers, manual backtrace failed (fp=%p)", pNewFP );
 
 		break;
 	}
 
 	int iDepth = 0;
 #if HAVE_BACKTRACE
-	sphSafeInfo ( iFD, "begin of system backtrace:" );
+	sphSafeInfo ( iFD, "Trying system backtrace:" );
 	iDepth = backtrace ( g_pBacktraceAddresses, SPH_BACKTRACE_ADDR_COUNT );
+	if ( iDepth>0 )
+		bOk = true;
 #if HAVE_BACKTRACE_SYMBOLS
 	sphSafeInfo ( iFD, "begin of system symbols:" );
 	backtrace_symbols_fd ( g_pBacktraceAddresses, iDepth, iFD );
@@ -1909,13 +1929,14 @@ void sphBacktrace ( int iFD, bool bSafe )
 #endif // HAVE_BACKTRACE_SYMBOLS
 #endif // !HAVE_BACKTRACE
 
+	sphSafeInfo ( iFD, "-------------- backtrace ends here ---------------" );
+
 	if ( bOk )
 		sphSafeInfo ( iFD, "Backtrace looks OK. Now you have to do following steps:\n"
 							"  1. Run the command over the crashed binary (for example, 'searchd'):\n"
 							"     nm -n searchd > searchd.sym\n"
 							"  2. Attach the binary, generated .sym and the text of backtrace (see above) to the bug report.\n"
 							"Also you can read the section about resolving backtraces in the documentation.");
-	sphSafeInfo ( iFD, "-------------- backtrace ends here ---------------" );
 
 	// convert all BT addresses to source code lines
 	int iCount = Min ( iDepth, (int)( sizeof(g_pArgv)/sizeof(g_pArgv[0]) - SPH_BT_ADDRS - 1 ) );
@@ -1935,35 +1956,71 @@ void sphBacktrace ( int iFD, bool bSafe )
 	}
 	g_pArgv[iCount+SPH_BT_ADDRS] = NULL;
 
-	// map stdout to log file
-	if ( iFD!=1 )
-	{
-		close ( 1 );
-		dup2 ( iFD, 1 );
-	}
-	execvp ( g_pArgv[0], const_cast<char **> ( g_pArgv ) ); // using execvp instead execv to auto find addr2line in directories
+	int iChild = fork();
 
-	// if we here - execvp failed, ask user to do conversion manually
-	sphSafeInfo ( iFD, "conversion failed (error '%s'):\n"
-		"  1. Run the command provided below over the crashed binary (for example, '%s'):\n"
-		"  2. Attach the source.txt to the bug report.", strerror ( errno ), g_pArgv[SPH_BT_BINARY_NAME] );
-
-	int iColumn = 0;
-	for ( int i=0; g_pArgv[i]!=NULL; i++ )
+	if ( iChild==0 )
 	{
-		const char * s = g_pArgv[i];
-		while ( *s )
-			s++;
-		int iLen = s-g_pArgv[i];
-		sphWrite ( iFD, g_pArgv[i], iLen );
-		sphWrite ( iFD, " ", 1 );
-		int iWas = iColumn % 80;
-		iColumn += iLen;
-		int iNow = iColumn % 80;
-		if ( iNow<iWas )
-			sphWrite ( iFD, "\n", 1 );
+		// map stdout to log file
+		if ( iFD!=1 )
+		{
+			close ( 1 );
+			dup2 ( iFD, 1 );
+		}
+
+		execvp ( g_pArgv[0], const_cast<char **> ( g_pArgv ) ); // using execvp instead execv to auto find addr2line in directories
+
+		// if we here - execvp failed, ask user to do conversion manually
+		sphSafeInfo ( iFD, "conversion failed (error '%s'):\n"
+			"  1. Run the command provided below over the crashed binary (for example, '%s'):\n"
+			"  2. Attach the source.txt to the bug report.", strerror ( errno ), g_pArgv[SPH_BT_BINARY_NAME] );
+
+		int iColumn = 0;
+		for ( int i=0; g_pArgv[i]!=NULL; i++ )
+		{
+			const char * s = g_pArgv[i];
+			while ( *s )
+				s++;
+			int iLen = s-g_pArgv[i];
+			sphWrite ( iFD, g_pArgv[i], iLen );
+			sphWrite ( iFD, " ", 1 );
+			int iWas = iColumn % 80;
+			iColumn += iLen;
+			int iNow = iColumn % 80;
+			if ( iNow<iWas )
+				sphWrite ( iFD, "\n", 1 );
+		}
+		sphWrite ( iFD, g_sSourceTail, sizeof(g_sSourceTail)-1 );
+		exit ( 1 );
+
+	} else
+	if ( iChild==-1 )
+	{
+		sphSafeInfo ( iFD, "fork for running execvp failed: [%d] %s", errno, strerror(errno) );
+		return;
 	}
-	sphWrite ( iFD, g_sSourceTail, sizeof(g_sSourceTail)-1 );
+
+	int iStatus, iResult;
+	do
+	{
+		// can be interrupted by pretty much anything (e.g. SIGCHLD from other searchd children)
+		iResult = waitpid ( iChild, &iStatus, 0 );
+
+		// they say this can happen if child exited and SIGCHLD was ignored
+		// a cleaner one would be to temporary handle it here, but can we be bothered
+		if ( iResult==-1 && errno==ECHILD )
+		{
+			iResult = iChild;
+			iStatus = 0;
+		}
+
+		if ( iResult==-1 && errno!=EINTR )
+		{
+			sphSafeInfo ( iFD, "waitpid() failed: [%d] %s", errno, strerror(errno) );
+			return;
+		}
+	} while ( iResult!=iChild );
+
+	sphSafeInfo ( iFD, "--- BT to source lines finished ---" );
 }
 
 void sphBacktraceSetBinaryName ( const char * sName )

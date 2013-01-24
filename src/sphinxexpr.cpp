@@ -15,7 +15,12 @@
 
 #include "sphinx.h"
 #include "sphinxexpr.h"
-#include "sphinxudf.h"
+
+extern "C"
+{
+	#include "sphinxudf.h"
+}
+
 #include "sphinxutils.h"
 #include "sphinxint.h"
 #include "sphinxjson.h"
@@ -47,6 +52,7 @@
 #endif // !USE_WINDOWS
 
 
+typedef int ( *UdfVer_fn ) ();
 typedef int ( *UdfInit_fn ) ( SPH_UDF_INIT * init, SPH_UDF_ARGS * args, char * error );
 typedef void ( *UdfDeinit_fn ) ( SPH_UDF_INIT * init );
 
@@ -91,7 +97,8 @@ struct UdfCall_t
 // hack hack hack
 UservarIntSet_c * ( *g_pUservarsHook )( const CSphString & sUservar );
 
-static bool								g_bUdfEnabled = false;
+static bool								g_bUdfEnabled = false;		///< is there any UDF support all?
+static bool								g_bUdfLocked = false;		///< do we allow CREATE/DROP at this point?
 static CSphString						g_sUdfDir;
 static CSphStaticMutex					g_tUdfMutex;
 static SmallStringHash_T<UdfLib_t>		g_hUdfLibs;
@@ -404,7 +411,7 @@ struct Expr_GetPackedFactors_c : public ISphStringExpr
 
 	virtual void SetupExtraData ( ISphExtra * pData )
 	{
-		pData->ExtraData ( EXTRA_GET_DATA_RANKFACTORS, (void**)&m_pHash );
+		pData->ExtraData ( EXTRA_GET_DATA_PACKEDFACTORS, (void**)&m_pHash );
 	}
 
 	virtual bool IsStringPtr() const
@@ -2022,6 +2029,12 @@ public:
 		ARRAY_FOREACH ( i, m_dArgs )
 			m_dArgs[i]->GetDependencyColumns ( dDeps );
 	}
+
+	virtual void SetupExtraData ( ISphExtra * pExtraData )
+	{
+		ARRAY_FOREACH ( i, m_dArgs )
+			m_dArgs[i]->SetupExtraData ( pExtraData );
+	}
 };
 
 
@@ -3350,7 +3363,7 @@ void ExprParser_t::WalkTree ( int iRoot, T & FUNCTOR )
 	if ( iRoot>=0 )
 	{
 		const ExprNode_t & tNode = m_dNodes[iRoot];
-		FUNCTOR.Enter ( tNode );
+		FUNCTOR.Enter ( tNode, m_dNodes );
 		WalkTree ( tNode.m_iLeft, FUNCTOR );
 		WalkTree ( tNode.m_iRight, FUNCTOR );
 		FUNCTOR.Exit ( tNode );
@@ -4098,6 +4111,40 @@ const char * ExprParser_t::Attr2Ident ( uint64_t uAttrLoc )
 
 //////////////////////////////////////////////////////////////////////////
 
+struct TypeCheck_fn
+{
+	bool * m_pRes;
+
+	explicit TypeCheck_fn ( bool * pRes )
+		: m_pRes ( pRes )
+	{
+		*m_pRes = false;
+	}
+
+	void Enter ( const ExprNode_t & tNode, const CSphVector<ExprNode_t> & dNodes )
+	{
+		bool bNumberOp = tNode.m_iToken=='+' || tNode.m_iToken=='-' || tNode.m_iToken=='*' || tNode.m_iToken=='/';
+		if ( bNumberOp )
+		{
+			bool bLeftNumeric =	tNode.m_iLeft==-1 ? false : IsNumericNode ( dNodes[tNode.m_iLeft] );
+			bool bRightNumeric = tNode.m_iRight==-1 ? false : IsNumericNode ( dNodes[tNode.m_iRight] );
+
+			if ( !bLeftNumeric || !bRightNumeric )
+				*m_pRes = true;
+		}
+	}
+
+	void Exit ( const ExprNode_t & )
+	{}
+
+	bool IsNumericNode ( const ExprNode_t & tNode )
+	{
+		return tNode.m_eRetType==SPH_ATTR_INTEGER || tNode.m_eRetType==SPH_ATTR_ORDINAL || tNode.m_eRetType==SPH_ATTR_BOOL || tNode.m_eRetType==SPH_ATTR_FLOAT ||
+			tNode.m_eRetType==SPH_ATTR_BIGINT || tNode.m_eRetType==SPH_ATTR_WORDCOUNT || tNode.m_eRetType==SPH_ATTR_TOKENCOUNT || tNode.m_eRetType==SPH_ATTR_TIMESTAMP;
+	}
+};
+
+
 struct WeightCheck_fn
 {
 	bool * m_pRes;
@@ -4109,7 +4156,7 @@ struct WeightCheck_fn
 		*m_pRes = false;
 	}
 
-	void Enter ( const ExprNode_t & tNode )
+	void Enter ( const ExprNode_t & tNode, const CSphVector<ExprNode_t> & )
 	{
 		if ( tNode.m_iToken==TOK_WEIGHT )
 			*m_pRes = true;
@@ -4128,7 +4175,7 @@ struct HookCheck_fn
 		: m_pHook ( pHook )
 	{}
 
-	void Enter ( const ExprNode_t & tNode )
+	void Enter ( const ExprNode_t & tNode, const CSphVector<ExprNode_t> & )
 	{
 		if ( tNode.m_iToken==TOK_HOOK_IDENT || tNode.m_iToken==TOK_HOOK_FUNC )
 			m_pHook->CheckEnter ( tNode.m_iFunc );
@@ -4208,6 +4255,15 @@ ISphExpr * ExprParser_t::Parse ( const char * sExpr, const CSphSchema & tSchema,
 	Dump ( m_iParsed );
 #endif
 
+	bool bTypeMismatch;
+	TypeCheck_fn tFunctor ( &bTypeMismatch );
+	WalkTree ( m_iParsed, tFunctor );
+	if ( bTypeMismatch )
+	{
+		sError.SetSprintf ( "numeric operation applied to non-numeric operands" );
+		return NULL;
+	}
+
 	// create evaluator
 	ISphExpr * pRes = CreateTree ( m_iParsed );
 	if ( !m_sCreateError.IsEmpty() )
@@ -4273,12 +4329,16 @@ const char * dlerror()
 }
 #endif // USE_WINDOWS
 
-
 #if !HAVE_DLOPEN
 
 void sphUDFInit ( const char * )
 {
 	return;
+}
+
+void sphUDFLock ( bool bLocked )
+{
+	g_bUdfLocked = bLocked;
 }
 
 bool sphUDFCreate ( const char *, const char *, ESphAttr, CSphString & sError )
@@ -4302,6 +4362,13 @@ void sphUDFInit ( const char * sUdfDir )
 
 	g_sUdfDir = sUdfDir;
 	g_bUdfEnabled = true;
+	g_bUdfLocked = false;
+}
+
+
+void sphUDFLock ( bool bLocked )
+{
+	g_bUdfLocked = bLocked;
 }
 
 
@@ -4309,7 +4376,12 @@ bool sphUDFCreate ( const char * szLib, const char * szFunc, ESphAttr eRetType, 
 {
 	if ( !g_bUdfEnabled )
 	{
-		sError = "UDF support disabled (requires workers=threads; and a valid plugin_dir)";
+		sError = "UDF support disabled (requires a valid plugin_dir)";
+		return false;
+	}
+	if ( g_bUdfLocked )
+	{
+		sError = "CREATE FUNCTION is disabled (fully dynamic UDFs require workers=threads)";
 		return false;
 	}
 
@@ -4384,6 +4456,28 @@ bool sphUDFCreate ( const char * szLib, const char * szFunc, ESphAttr eRetType, 
 	// add library
 	if ( bLoaded )
 	{
+		CSphString sLib = szLib;
+		const char * pDot = strchr ( sLib.cstr(), '.' );
+		if ( pDot )
+			sLib = sLib.SubString ( 0, pDot-sLib.cstr() );
+
+		UdfVer_fn fnVer = (UdfVer_fn) dlsym ( pHandle, sName.SetSprintf ( "%s_ver", sLib.cstr() ).cstr() );
+		if ( !fnVer )
+		{
+			sError.SetSprintf ( "symbol '%s_ver' not found in '%s': update your UDF implementation", sLib.cstr(), szLib );
+			dlclose ( pHandle );
+			g_tUdfMutex.Unlock();
+			return false;
+		}
+
+		if ( fnVer() < SPH_UDF_VERSION )
+		{
+			sError.SetSprintf ( "library '%s' was compiled using an older version of sphinxudf.h; it needs to be recompiled", szLib );
+			dlclose ( pHandle );
+			g_tUdfMutex.Unlock();
+			return false;
+		}
+
 		UdfLib_t tLib;
 		tLib.m_iFuncs = 1;
 		tLib.m_pHandle = pHandle;
@@ -4407,6 +4501,12 @@ bool sphUDFCreate ( const char * szLib, const char * szFunc, ESphAttr eRetType, 
 
 bool sphUDFDrop ( const char * szFunc, CSphString & sError )
 {
+	if ( g_bUdfLocked )
+	{
+		sError = "DROP FUNCTION is disabled (fully dynamic UDFs require workers=threads)";
+		return false;
+	}
+
 	CSphString sFunc ( szFunc );
 	sFunc.ToLower();
 

@@ -16,6 +16,7 @@
 #include "sphinx.h"
 #include "sphinxint.h"
 #include "sphinxutils.h"
+#include "sphinxstem.h"
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ctype.h>
@@ -193,12 +194,12 @@ public:
 	virtual SphWordID_t	GetWordID ( BYTE * pWord );
 	virtual SphWordID_t	GetWordID ( const BYTE * pWord, int iLen, bool );
 
-	virtual void		LoadStopwords ( const char *, ISphTokenizer * ) {}
+	virtual void		LoadStopwords ( const char *, const ISphTokenizer * ) {}
 	virtual void		LoadStopwords ( const CSphVector<SphWordID_t> & ) {}
 	virtual void		WriteStopwords ( CSphWriter & ) {}
-	virtual bool		LoadWordforms ( const CSphVector<CSphString> &, const CSphEmbeddedFiles *, ISphTokenizer *, const char * ) { return true; }
+	virtual bool		LoadWordforms ( const CSphVector<CSphString> &, const CSphEmbeddedFiles *, const ISphTokenizer *, const char * ) { return true; }
 	virtual void		WriteWordforms ( CSphWriter & ) {}
-	virtual bool		SetMorphology ( const char *, bool ) { return true; }
+	virtual int			SetMorphology ( const char *, bool, CSphString & ) { return ST_OK; }
 
 	virtual void		Setup ( const CSphDictSettings & tSettings ) { m_tSettings = tSettings; }
 	virtual const CSphDictSettings & GetSettings () const { return m_tSettings; }
@@ -934,11 +935,19 @@ bool DoIndex ( const CSphConfigSection & hIndex, const char * sIndexName,
 		// multiforms filter
 		sphConfDictionary ( hIndex, tDictSettings );
 
+		if ( tSettings.m_bAotFilter )
+		{
+			CSphString sDictFile;
+			sDictFile.SetSprintf ( "%s/ru.pak", g_sLemmatizerBase.cstr() );
+			if ( !sphAotInitRu ( sDictFile, sError ) )
+				sphDie ( "index '%s': %s", sIndexName, sError.cstr() );
+		}
+
 		pDict = tDictSettings.m_bWordDict
-			? sphCreateDictionaryKeywords ( tDictSettings, NULL, pTokenizer, sIndexName )
-			: sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer, sIndexName );
+			? sphCreateDictionaryKeywords ( tDictSettings, NULL, pTokenizer, sIndexName, sError )
+			: sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer, sIndexName, sError );
 		if ( !pDict )
-			sphDie ( "index '%s': unable to create dictionary", sIndexName );
+			sphDie ( "index '%s': %s", sIndexName, sError.cstr() );
 
 		pTokenizer = ISphTokenizer::CreateMultiformFilter ( pTokenizer, pDict->GetMultiWordforms () );
 
@@ -946,6 +955,10 @@ bool DoIndex ( const CSphConfigSection & hIndex, const char * sIndexName,
 		pTokenizer = ISphTokenizer::CreateBigramFilter ( pTokenizer, tSettings.m_eBigramIndex, tSettings.m_sBigramWords, sError );
 		if ( !pTokenizer )
 			sphDie ( "index '%s': %s", sIndexName, sError.cstr() );
+
+		// aot filter
+		if ( tSettings.m_bAotFilter )
+			pTokenizer = sphAotCreateFilter ( pTokenizer, pDict );
 	}
 
 	ISphFieldFilter * pFieldFilter = NULL;
@@ -1565,6 +1578,7 @@ int main ( int argc, char ** argv )
 	CSphVector<CSphFilterSettings> dMergeDstFilters;
 
 	CSphVector<const char *> dIndexes;
+	CSphVector<const char *> dWildIndexes;
 	bool bIndexAll = false;
 	bool bMergeKillLists = false;
 	bool bVerbose = false;
@@ -1636,9 +1650,25 @@ int main ( int argc, char ** argv )
 		{
 			bVerbose = true;
 
-		} else if ( isalnum ( argv[i][0] ) || argv[i][0]=='_' )
+		} else if ( isalnum ( argv[i][0] ) || argv[i][0]=='_' || sphIsWild ( argv[i][0] ) )
 		{
-			dIndexes.Add ( argv[i] );
+			bool bHasWilds = false;
+			const char * s = argv[i];
+
+			while ( *s )
+			{
+				if ( sphIsWild(*s) )
+				{
+					bHasWilds = true;
+					break;
+				}
+				s++;
+			}
+
+			if ( bHasWilds )
+				dWildIndexes.Add ( argv[i] );
+			else
+				dIndexes.Add ( argv[i] );
 
 		} else if ( strcasecmp ( argv[i], "--dump-rows" )==0 && (i+1)<argc )
 		{
@@ -1713,7 +1743,7 @@ int main ( int argc, char ** argv )
 		return 1;
 	}
 
-	if ( !bMerge && !bIndexAll && !dIndexes.GetLength() )
+	if ( !bMerge && !bIndexAll && !dIndexes.GetLength() && !dWildIndexes.GetLength() )
 	{
 		fprintf ( stdout, "ERROR: nothing to do.\n" );
 		return 1;
@@ -1782,6 +1812,10 @@ int main ( int argc, char ** argv )
 		sphSetJsonOptions ( bJsonStrict, bJsonAutoconvNumbers, bJsonKeynamesToLowercase );
 
 		sphSetThrottling ( hIndexer.GetInt ( "max_iops", 0 ), hIndexer.GetSize ( "max_iosize", 0 ) );
+
+		if ( hIndexer("lemmatizer_base") )
+			g_sLemmatizerBase = hIndexer["lemmatizer_base"];
+		sphAotSetCacheSize ( hIndexer.GetSize ( "lemmatizer_cache", 262144 ) );
 	}
 
 	/////////////////////
@@ -1796,7 +1830,23 @@ int main ( int argc, char ** argv )
 			sphDie ( "failed to open %s: %s", sDumpRows.cstr(), strerror(errno) );
 	}
 
-	sphStartIOStats ();
+	hConf["index"].IterateStart();
+	while ( hConf["index"].IterateNext() )
+	{
+		ARRAY_FOREACH ( i, dWildIndexes )
+		{
+			if ( sphWildcardMatch ( hConf["index"].IterateGetKey().cstr(), dWildIndexes[i] ) )
+			{
+				dIndexes.Add ( hConf["index"].IterateGetKey().cstr() );
+				// do not add index twice
+				break;
+			}
+		}
+	}
+
+	sphInitIOStats ();
+	CSphIOStats tIO;
+	tIO.Start();
 
 	bool bIndexedOk = false; // if any of the indexes are ok
 	if ( bMerge )
@@ -1843,13 +1893,14 @@ int main ( int argc, char ** argv )
 
 	sphShutdownWordforms ();
 
-	const CSphIOStats & tStats = sphStopIOStats ();
-
 	if ( !g_bQuiet )
 	{
-		ReportIOStats ( "reads", tStats.m_iReadOps, tStats.m_iReadTime, tStats.m_iReadBytes );
-		ReportIOStats ( "writes", tStats.m_iWriteOps, tStats.m_iWriteTime, tStats.m_iWriteBytes );
+		ReportIOStats ( "reads", tIO.m_iReadOps, tIO.m_iReadTime, tIO.m_iReadBytes );
+		ReportIOStats ( "writes", tIO.m_iWriteOps, tIO.m_iWriteTime, tIO.m_iWriteBytes );
 	}
+
+	tIO.Stop();
+	sphDoneIOStats();
 
 	////////////////////////////
 	// rotating searchd indices

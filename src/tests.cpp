@@ -767,9 +767,10 @@ void TestQueryParser ()
 	tCol.m_sName = "title"; tSchema.m_dFields.Add ( tCol );
 	tCol.m_sName = "body"; tSchema.m_dFields.Add ( tCol );
 
+	CSphString sError;
 	CSphDictSettings tDictSettings;
 	CSphScopedPtr<ISphTokenizer> pTokenizer ( sphCreateSBCSTokenizer () );
-	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query" ) );
+	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query", sError ) );
 	assert ( pTokenizer.Ptr() );
 	assert ( pDict.Ptr() );
 
@@ -778,7 +779,6 @@ void TestQueryParser ()
 	tTokenizerSetup.m_sSynonymsFile = g_sTmpfile;
 	pTokenizer->Setup ( tTokenizerSetup );
 
-	CSphString sError;
 	assert ( CreateSynonymsFile ( NULL ) );
 	assert ( pTokenizer->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
 
@@ -859,6 +859,7 @@ public:
 	virtual void				PostSetup() {}
 	virtual bool				EarlyReject ( CSphQueryContext * , CSphMatch & ) const { return false; }
 	virtual const CSphSourceStats &	GetStats () const { return g_tTmpDummyStat; }
+	virtual CSphIndexStatus			GetStatus () const { CSphIndexStatus tRes; tRes.m_iRamUse = 0; return tRes; }
 	virtual bool				MultiQuery ( const CSphQuery * , CSphQueryResult * , int , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, bool ) const { return false; }
 	virtual bool				MultiQueryEx ( int , const CSphQuery * , CSphQueryResult ** , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, bool ) const { return false; }
 	virtual bool				GetKeywords ( CSphVector <CSphKeywordInfo> & , const char * , bool , CSphString & ) const { return false; }
@@ -896,18 +897,19 @@ void TestQueryTransforms ()
 	tCol.m_sName = "title"; tSchema.m_dFields.Add ( tCol );
 	tCol.m_sName = "body"; tSchema.m_dFields.Add ( tCol );
 
+	CSphString sError;
 	CSphDictSettings tDictSettings;
 	CSphScopedPtr<ISphTokenizer> pTokenizer ( sphCreateSBCSTokenizer () );
-	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query" ) );
+	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query", sError ) );
 	assert ( pTokenizer.Ptr() );
 	assert ( pDict.Ptr() );
+	assert ( sError.IsEmpty() );
 
 	CSphTokenizerSettings tTokenizerSetup;
 	tTokenizerSetup.m_iMinWordLen = 2;
 	tTokenizerSetup.m_sSynonymsFile = g_sTmpfile;
 	pTokenizer->Setup ( tTokenizerSetup );
 
-	CSphString sError;
 	assert ( CreateSynonymsFile ( NULL ) );
 	assert ( pTokenizer->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
 
@@ -2077,7 +2079,7 @@ void TestRTWeightBoundary ()
 		CSphDictSettings tDictSettings;
 
 		ISphTokenizer * pTok = sphCreateUTF8Tokenizer();
-		CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "weight" );
+		CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "weight", sError );
 
 		CSphColumnInfo tCol;
 		CSphSchema tSrcSchema;
@@ -2141,7 +2143,7 @@ void TestRTWeightBoundary ()
 
 		pSrc->Disconnect();
 
-		CheckRT ( pSrc->GetStats().m_iTotalDocuments, 1, "docs committed" );
+		CheckRT ( (int)pSrc->GetStats().m_iTotalDocuments, 1, "docs committed" );
 
 		CSphQuery tQuery;
 		CSphQueryResult tResult;
@@ -2252,7 +2254,7 @@ void TestRTSendVsMerge ()
 	CSphDictSettings tDictSettings;
 
 	ISphTokenizer * pTok = sphCreateUTF8Tokenizer();
-	CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "rt" );
+	CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "rt", sError );
 
 	CSphColumnInfo tCol;
 	CSphSchema tSrcSchema;
@@ -2613,6 +2615,11 @@ void TestWildcards()
 	assert ( sphWildcardMatch ( "axb", "a%%b" ) );
 	assert ( sphWildcardMatch ( "axyb", "a%%b" ) );
 	assert ( !sphWildcardMatch ( "axyzb", "a%%b" ) );
+	assert ( sphWildcardMatch ( "a*b", "a?b" ) );
+	assert ( sphWildcardMatch ( "a*b", "a*b" ) );
+	assert ( sphWildcardMatch ( "a*b", "a\\*b" ) );
+	assert ( !sphWildcardMatch ( "acb", "a\\*b" ) );
+	assert ( !sphWildcardMatch ( "acdeb", "a\\*b" ) );
 	printf ( "ok\n" );
 }
 
