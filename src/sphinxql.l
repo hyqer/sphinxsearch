@@ -19,6 +19,7 @@
 DIGIT				[0-9]
 ID					[a-zA-Z_][a-zA-Z_0-9\.]*
 SPACE				[ \t\n\r]
+EXPONENT			[eE](\+|-)?{DIGIT}+
 
 %option noyywrap
 %option nounput
@@ -124,8 +125,9 @@ SPACE				[ \t\n\r]
 
 '([^'\\]|\\.|\\\\)*'	{ YYSTOREBOUNDS; SqlUnescape ( lvalp->m_sValue, yytext, yyleng ); return TOK_QUOTED_STRING; }
 
-{DIGIT}+\.{DIGIT}*	{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_fValue = (float)strtod ( yytext, NULL ); return TOK_CONST_FLOAT; }
-\.{DIGIT}+			{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_fValue = (float)strtod ( yytext, NULL ); return TOK_CONST_FLOAT; }
+{DIGIT}+\.{DIGIT}*{EXPONENT}?	{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_fValue = (float)strtod ( yytext, NULL ); return TOK_CONST_FLOAT; }
+\.{DIGIT}+{EXPONENT}?			{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_fValue = (float)strtod ( yytext, NULL ); return TOK_CONST_FLOAT; }
+{DIGIT}+{EXPONENT}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_fValue = (float)strtod ( yytext, NULL ); return TOK_CONST_FLOAT; }
 {DIGIT}+			{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; lvalp->m_iValue = (int64_t)strtoull ( yytext, NULL, 10 ); return TOK_CONST_INT; }
 
 "@id"				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_ATIDENT; }
@@ -134,6 +136,7 @@ SPACE				[ \t\n\r]
 {ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_IDENT; }
 @{ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_USERVAR; }
 @@{ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_SYSVAR; }
+"`ID`"				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_ID; }
 `{ID}`				{ YYSTOREBOUNDS; lvalp->m_iStart++; lvalp->m_iEnd--; lvalp->m_sValue.SetBinary ( yytext+1, strlen(yytext)-2 ); return TOK_IDENT; }
 
 {SPACE}+			{ ; }

@@ -116,6 +116,7 @@ struct ServedDesc_t
 	bool				m_bToDelete;
 	bool				m_bOnlyNew;
 	bool				m_bRT;
+	CSphString			m_sGlobalIDFPath;
 
 						ServedDesc_t ();
 						~ServedDesc_t ();
@@ -437,6 +438,8 @@ static CSphMutex							g_tRotateQueueMutex;
 static CSphVector<CSphString>				g_dRotateQueue;		// FIXME? maybe replace it with lockless ring buffer
 static CSphMutex							g_tRotateConfigMutex;
 static SphThread_t							g_tRotateThread;
+static SphThread_t							g_tRotationServiceThread;
+static volatile bool						g_bInvokeRotationService = false;
 
 /// flush parameters of rt indexes
 static SphThread_t							g_tRtFlushThread;
@@ -1622,6 +1625,8 @@ void Shutdown ()
 			g_tOptimizeQueueMutex.Done();
 		}
 
+		sphThreadJoin ( &g_tRotationServiceThread );
+
 #if !USE_WINDOWS
 		if ( g_eWorkers==MPM_FORK || g_eWorkers==MPM_PREFORK )
 		{
@@ -1681,6 +1686,7 @@ void Shutdown ()
 		sphRTDone();
 
 		sphShutdownWordforms ();
+		sphShutdownGlobalIDFs ();
 	}
 
 	ARRAY_FOREACH ( i, g_dListeners )
@@ -6438,6 +6444,7 @@ void LogQuerySphinxql ( const CSphQuery & q, const CSphQueryResult & tRes, const
 		{
 			if ( bDeflowered )
 				tBuf.Append ( " AND" );
+			bDeflowered = true;
 
 			const CSphFilterSettings & f = q.m_dFilters[i];
 			switch ( f.m_eType )
@@ -6468,21 +6475,46 @@ void LogQuerySphinxql ( const CSphQuery & q, const CSphQueryResult & tRes, const
 					break;
 
 				case SPH_FILTER_RANGE:
-					if ( f.m_bExclude )
-						tBuf.Append ( " %s NOT BETWEEN "INT64_FMT" AND "INT64_FMT,
-						f.m_sAttrName.cstr(), f.m_iMinValue, f.m_iMaxValue );
-					else
-						tBuf.Append ( " %s BETWEEN "INT64_FMT" AND "INT64_FMT,
-							f.m_sAttrName.cstr(), f.m_iMinValue, f.m_iMaxValue );
+					if ( f.m_iMinValue==INT64_MIN || ( f.m_iMinValue==0 && f.m_sAttrName=="@id" ) )
+					{
+						// no min, thus (attr<maxval)
+						const char * sOps[2][2] = { { "<", "<=" }, { ">=", ">" } };
+						tBuf.Append ( " %s%s"INT64_FMT, f.m_sAttrName.cstr(),
+							sOps [ f.m_bExclude ][ f.m_bHasEqual ], f.m_iMaxValue );
+					} else if ( f.m_iMaxValue==INT64_MAX || ( f.m_iMaxValue==-1 && f.m_sAttrName=="@id" ) )
+					{
+						// mo max, thus (attr>minval)
+						const char * sOps[2][2] = { { ">", ">=" }, { "<", "<=" } };
+						tBuf.Append ( " %s%s"INT64_FMT, f.m_sAttrName.cstr(),
+							sOps [ f.m_bExclude ][ f.m_bHasEqual ], f.m_iMinValue );
+					} else
+					{
+						tBuf.Append ( " %s%s BETWEEN "INT64_FMT" AND "INT64_FMT,
+							f.m_sAttrName.cstr(), f.m_bExclude ? " NOT" : "",
+							f.m_iMinValue + !f.m_bHasEqual, f.m_iMaxValue - !f.m_bHasEqual );
+					}
 					break;
 
 				case SPH_FILTER_FLOATRANGE:
-					if ( f.m_bExclude )
-						tBuf.Append ( " %s NOT BETWEEN %f AND %f",
-						f.m_sAttrName.cstr(), f.m_fMinValue, f.m_fMaxValue );
-					else
-						tBuf.Append ( " %s BETWEEN %f AND %f",
-							f.m_sAttrName.cstr(), f.m_fMinValue, f.m_fMaxValue );
+					if ( f.m_fMinValue==-FLT_MAX )
+					{
+						// no min, thus (attr<maxval)
+						const char * sOps[2][2] = { { "<", "<=" }, { ">=", ">" } };
+						tBuf.Append ( " %s%s%f", f.m_sAttrName.cstr(),
+							sOps [ f.m_bExclude ][ f.m_bHasEqual ], f.m_fMaxValue );
+					} else if ( f.m_fMaxValue==FLT_MAX )
+					{
+						// mo max, thus (attr>minval)
+						const char * sOps[2][2] = { { ">", ">=" }, { "<", "<=" } };
+						tBuf.Append ( " %s%s%f", f.m_sAttrName.cstr(),
+							sOps [ f.m_bExclude ][ f.m_bHasEqual ], f.m_fMinValue );
+					} else
+					{
+						// FIXME? need we handle m_bHasEqual here?
+						tBuf.Append ( " %s%s BETWEEN %f AND %f",
+							f.m_sAttrName.cstr(), f.m_bExclude ? " NOT" : "",
+							f.m_fMinValue, f.m_fMaxValue );
+					}
 					break;
 
 				default:
@@ -8048,8 +8080,8 @@ bool MinimizeAggrResult ( AggrResult_t & tRes, CSphQuery & tQuery, int iLocals, 
 				const CSphColumnInfo & tCol = tRes.m_tSchema.GetAttr ( dPostlimit[j] );
 
 				// OPTIMIZE? only if the tag did not change?
-				tCol.m_pExpr->SetMVAPool ( tRes.m_dTag2Pools [ tMatch.m_iTag ].m_pMva );
-				tCol.m_pExpr->SetStringPool ( tRes.m_dTag2Pools [ tMatch.m_iTag ].m_pStrings );
+				tCol.m_pExpr->Command ( SPH_EXPR_SET_MVA_POOL, (void*)tRes.m_dTag2Pools [ tMatch.m_iTag ].m_pMva );
+				tCol.m_pExpr->Command ( SPH_EXPR_SET_STRING_POOL, (void*)tRes.m_dTag2Pools [ tMatch.m_iTag ].m_pStrings );
 
 				if ( tCol.m_eAttrType==SPH_ATTR_INTEGER )
 					tMatch.SetAttr ( tCol.m_tLocator, tCol.m_pExpr->IntEval(tMatch) );
@@ -8367,9 +8399,9 @@ struct Expr_Snippet_c : public ISphStringExpr
 	virtual void SetStringPool ( const BYTE * pStrings )
 	{
 		if ( m_pArgs )
-			m_pArgs->SetStringPool ( pStrings );
+			m_pArgs->Command ( SPH_EXPR_SET_STRING_POOL, (void*)pStrings );
 		if ( m_pText )
-			m_pText->SetStringPool ( pStrings );
+			m_pText->Command ( SPH_EXPR_SET_STRING_POOL, (void*)pStrings );
 	}
 };
 
@@ -10654,7 +10686,7 @@ CSphFilterSettings * SqlParser_c::AddFilter ( const CSphString & sCol, ESphFilte
 		return NULL;
 	}
 	CSphFilterSettings * pFilter = &m_pQuery->m_dFilters.Add();
-	pFilter->m_sAttrName = sCol;
+	pFilter->m_sAttrName = ( sCol=="id" ) ? "@id" : sCol ;
 	pFilter->m_eType = eType;
 	sphColumnToLowercase ( const_cast<char *>( pFilter->m_sAttrName.cstr() ) );
 	return pFilter;
@@ -10686,7 +10718,7 @@ bool SqlParser_c::AddIntFilterGreater ( const CSphString & sAttr, int64_t iVal, 
 	CSphFilterSettings * pFilter = AddFilter ( sAttr, SPH_FILTER_RANGE );
 	if ( !pFilter )
 		return false;
-	bool bId = sAttr=="@id";
+	bool bId = ( sAttr=="@id" ) || ( sAttr=="id" );
 	pFilter->m_iMinValue = iVal;
 	pFilter->m_iMaxValue = bId ? (SphAttr_t)ULLONG_MAX : LLONG_MAX;
 	pFilter->m_bHasEqual = bHasEqual;
@@ -10698,7 +10730,7 @@ bool SqlParser_c::AddIntFilterLesser ( const CSphString & sAttr, int64_t iVal, b
 	CSphFilterSettings * pFilter = AddFilter ( sAttr, SPH_FILTER_RANGE );
 	if ( !pFilter )
 		return false;
-	bool bId = sAttr=="@id";
+	bool bId = ( sAttr=="@id" ) || ( sAttr=="id" );
 	pFilter->m_iMinValue = bId ? 0 : LLONG_MIN;
 	pFilter->m_iMaxValue = iVal;
 	pFilter->m_bHasEqual = bHasEqual;
@@ -14521,13 +14553,13 @@ void HandleMysqlMeta ( SqlRowBuffer_c & dRows, const SqlStmt_t & tStmt, const CS
 }
 
 
-static void LocalIndexDoDeleteDocuments ( const char * sName, const SphDocID_t * pDocs, int iCount,
+static int LocalIndexDoDeleteDocuments ( const char * sName, const SphDocID_t * pDocs, int iCount,
 											const ServedIndex_t * pLocked, SearchFailuresLog_c & dErrors, bool bCommit )
 {
 	if ( !pLocked )
 	{
 		dErrors.Submit ( sName, "no such index" );
-		return;
+		return 0;
 	}
 
 	CSphString sError;
@@ -14536,17 +14568,20 @@ static void LocalIndexDoDeleteDocuments ( const char * sName, const SphDocID_t *
 	{
 		sError.SetSprintf ( "does not support DELETE (enabled=%d)", pLocked->m_bEnabled );
 		dErrors.Submit ( sName, sError.cstr() );
-		return;
+		return 0;
 	}
 
 	if ( !pIndex->DeleteDocument ( pDocs, iCount, sError ) )
 	{
 		dErrors.Submit ( sName, sError.cstr() );
-		return;
+		return 0;
 	}
 
+	int iAffected = 0;
 	if ( bCommit )
-		pIndex->Commit();
+		pIndex->Commit ( &iAffected );
+
+	return iAffected;
 }
 
 
@@ -14592,6 +14627,7 @@ void HandleMysqlDelete ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 	SearchFailuresLog_c dErrors;
 	const SphDocID_t * pDocs = tStmt.m_dDeleteIds.Begin();
 	int iDocsCount = tStmt.m_dDeleteIds.GetLength();
+	int iAffected = 0;
 
 	// delete for local indexes
 	ARRAY_FOREACH ( iIdx, dNames )
@@ -14600,7 +14636,7 @@ void HandleMysqlDelete ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 		const ServedIndex_t * pLocal = g_pLocalIndexes->GetRlockedEntry ( sName );
 		if ( pLocal )
 		{
-			LocalIndexDoDeleteDocuments ( sName, pDocs, iDocsCount, pLocal, dErrors, bCommit );
+			iAffected += LocalIndexDoDeleteDocuments ( sName, pDocs, iDocsCount, pLocal, dErrors, bCommit );
 			pLocal->Unlock();
 		} else
 		{
@@ -14611,7 +14647,7 @@ void HandleMysqlDelete ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 			{
 				const char * sDistLocal = dDistLocal[i].cstr();
 				const ServedIndex_t * pDistLocal = g_pLocalIndexes->GetRlockedEntry ( sDistLocal );
-				LocalIndexDoDeleteDocuments ( sDistLocal, pDocs, iDocsCount, pDistLocal, dErrors, bCommit );
+				iAffected += LocalIndexDoDeleteDocuments ( sDistLocal, pDocs, iDocsCount, pDistLocal, dErrors, bCommit );
 				if ( pDistLocal )
 					pDistLocal->Unlock();
 			}
@@ -14635,6 +14671,7 @@ void HandleMysqlDelete ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 				int iWarns = 0;
 				SphinxqlReplyParser_t tParser ( &iGot, &iWarns );
 				RemoteWaitForAgents ( dAgents, tDist.m_iAgentQueryTimeout, tParser ); // FIXME? profile update time too?
+				iAffected += iGot;
 			}
 		}
 	}
@@ -14647,7 +14684,7 @@ void HandleMysqlDelete ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 		return;
 	}
 
-	tOut.Ok();
+	tOut.Ok ( iAffected );
 }
 
 
@@ -15770,6 +15807,7 @@ bool RotateIndexGreedy ( ServedIndex_t & tIndex, const char * sIndex )
 	CSphString sWarning;
 	ISphTokenizer * pTokenizer = tIndex.m_pIndex->LeakTokenizer (); // FIXME! disable support of that old indexes and remove this bullshit
 	CSphDict * pDictionary = tIndex.m_pIndex->LeakDictionary ();
+	tIndex.m_pIndex->SetGlobalIDFPath ( tIndex.m_sGlobalIDFPath );
 
 	if ( !tIndex.m_pIndex->Prealloc ( tIndex.m_bMlock, g_bStripPath, sWarning ) || !tIndex.m_pIndex->Preread() )
 	{
@@ -16090,6 +16128,7 @@ static void RotateIndexMT ( const CSphString & sIndex )
 	tNewIndex.m_pIndex->m_bExpandKeywords = pRotating->m_bExpand;
 	tNewIndex.m_pIndex->SetPreopen ( pRotating->m_bPreopen || g_bPreopenIndexes );
 	tNewIndex.m_pIndex->SetWordlistPreload ( !pRotating->m_bOnDiskDict && !g_bOnDiskDicts );
+	tNewIndex.m_pIndex->SetGlobalIDFPath ( pRotating->m_sGlobalIDFPath );
 
 	// rebase new index
 	char sNewPath [ SPH_MAX_FILENAME_LEN ];
@@ -16271,6 +16310,7 @@ void IndexRotationDone ()
 #endif
 
 	g_iRotateCount = Max ( 0, g_iRotateCount-1 );
+	g_bInvokeRotationService = true;
 	sphInfo ( "rotating finished" );
 }
 
@@ -16298,6 +16338,7 @@ void SeamlessTryToForkPrereader ()
 	g_pPrereading->m_bExpandKeywords = tServed.m_bExpand;
 	g_pPrereading->SetPreopen ( tServed.m_bPreopen || g_bPreopenIndexes );
 	g_pPrereading->SetWordlistPreload ( !tServed.m_bOnDiskDict && !g_bOnDiskDicts );
+	g_pPrereading->SetGlobalIDFPath ( tServed.m_sGlobalIDFPath );
 
 	// rebase buffer index
 	char sNewPath [ SPH_MAX_FILENAME_LEN ];
@@ -16897,6 +16938,7 @@ void ConfigureLocalIndex ( ServedDesc_t & tIdx, const CSphConfigSection & hIndex
 	tIdx.m_bExpand = ( hIndex.GetInt ( "expand_keywords", 0 )!=0 );
 	tIdx.m_bPreopen = ( hIndex.GetInt ( "preopen", 0 )!=0 );
 	tIdx.m_bOnDiskDict = ( hIndex.GetInt ( "ondisk_dict", 0 )!=0 );
+	tIdx.m_sGlobalIDFPath = hIndex.GetStr ( "global_idf" );
 }
 
 
@@ -17271,6 +17313,7 @@ void PreCreatePlainIndex ( ServedDesc_t & tServed, const char * sName )
 	tServed.m_pIndex->m_iExpansionLimit = g_iExpansionLimit;
 	tServed.m_pIndex->SetPreopen ( tServed.m_bPreopen || g_bPreopenIndexes );
 	tServed.m_pIndex->SetWordlistPreload ( !tServed.m_bOnDiskDict && !g_bOnDiskDicts );
+	tServed.m_pIndex->SetGlobalIDFPath ( tServed.m_sGlobalIDFPath );
 	tServed.m_bEnabled = false;
 }
 
@@ -17385,6 +17428,7 @@ ESphAddIndex AddIndex ( const char * szIndexName, const CSphConfigSection & hInd
 		tIdx.m_pIndex->m_iExpansionLimit = g_iExpansionLimit;
 		tIdx.m_pIndex->SetPreopen ( tIdx.m_bPreopen || g_bPreopenIndexes );
 		tIdx.m_pIndex->SetWordlistPreload ( !tIdx.m_bOnDiskDict && !g_bOnDiskDicts );
+		tIdx.m_pIndex->SetGlobalIDFPath ( tIdx.m_sGlobalIDFPath );
 
 		tIdx.m_pIndex->Setup ( tSettings );
 
@@ -17428,14 +17472,6 @@ ESphAddIndex AddIndex ( const char * szIndexName, const CSphConfigSection & hInd
 		// try to create index
 		tIdx.m_sIndexPath = hIndex["path"];
 		PreCreatePlainIndex ( tIdx, szIndexName );
-
-		if ( hIndex.Exists ( "global_idf" ) )
-		{
-			if ( g_eWorkers==MPM_FORK || g_eWorkers==MPM_PREFORK )
-				sphWarning ( "index '%s': global IDF requires workers=threads; IGNORED", szIndexName );
-			else
-				tIdx.m_pIndex->SetGlobalIDFPath ( hIndex.GetStr ( "global_idf" ) );
-		}
 
 		// done
 		if ( !g_pLocalIndexes->Add ( tIdx, szIndexName ) )
@@ -17645,6 +17681,33 @@ void CheckDelete ()
 }
 
 
+void CheckRotateGlobalIDFs ()
+{
+	CSphVector <CSphString> dFiles;
+	for ( IndexHashIterator_c it ( g_pLocalIndexes ); it.Next(); )
+	{
+		ServedIndex_t & tIndex = it.Get();
+		if ( tIndex.m_bEnabled && !tIndex.m_sGlobalIDFPath.IsEmpty() )
+			dFiles.Add ( tIndex.m_sGlobalIDFPath );
+	}
+	sphUpdateGlobalIDFs ( dFiles );
+}
+
+
+void RotationServiceThreadFunc ( void * )
+{
+	while ( !g_bShutdown )
+	{
+		if ( g_bInvokeRotationService )
+		{
+			CheckRotateGlobalIDFs ();
+			g_bInvokeRotationService = false;
+		}
+		sphSleepMsec ( 50 );
+	}
+}
+
+
 void CheckRotate ()
 {
 	// do we need to rotate now?
@@ -17758,6 +17821,7 @@ void CheckRotate ()
 	{
 		g_iRotateCount = Max ( 0, g_iRotateCount-1 );
 		sphWarning ( "nothing to rotate after SIGHUP ( in queue=%d )", g_iRotateCount );
+		g_bInvokeRotationService = true;
 	}
 
 	if ( g_eWorkers!=MPM_THREADS && iRotIndexes )
@@ -18171,7 +18235,7 @@ void ShowHelp ()
 		"-p, --port <port>\tlisten on given port (overrides config setting)\n"
 		"-l, --listen <spec>\tlisten on given address, port or path (overrides\n"
 		"\t\t\tconfig settings)\n"
-		"-i, --index <index>\tonly serve one given index\n"
+		"-i, --index <index>\tonly serve given index(es)\n"
 #if !USE_WINDOWS
 		"--nodetach\t\tdo not detach into background\n"
 #endif
@@ -19139,7 +19203,7 @@ void ConfigureSearchd ( const CSphConfig & hConf, bool bOptPIDFile )
 		g_sLemmatizerBase = hConf["indexer"]["indexer"]["lemmatizer_base"];
 }
 
-void ConfigureAndPreload ( const CSphConfig & hConf, const char * sOptIndex )
+void ConfigureAndPreload ( const CSphConfig & hConf, const CSphVector<const char *> & dOptIndexes )
 {
 	int iCounter = 1;
 	int iValidIndexes = 0;
@@ -19151,8 +19215,17 @@ void ConfigureAndPreload ( const CSphConfig & hConf, const char * sOptIndex )
 		const CSphConfigSection & hIndex = hConf["index"].IterateGet();
 		const char * sIndexName = hConf["index"].IterateGetKey().cstr();
 
-		if ( g_bOptNoDetach && sOptIndex && strcasecmp ( sIndexName, sOptIndex )!=0 )
-			continue;
+		if ( g_bOptNoDetach && dOptIndexes.GetLength()!=0 )
+		{
+			bool bSkipIndex = true;
+
+			ARRAY_FOREACH_COND ( i, dOptIndexes, bSkipIndex )
+				if ( !strcasecmp ( sIndexName, dOptIndexes[i] ) )
+					bSkipIndex = false;
+
+			if ( bSkipIndex )
+				continue;
+		}
 
 		ESphAddIndex eAdd = AddIndex ( sIndexName, hIndex );
 		if ( eAdd==ADD_LOCAL || eAdd==ADD_RT )
@@ -19196,6 +19269,10 @@ void ConfigureAndPreload ( const CSphConfig & hConf, const char * sOptIndex )
 
 			if ( !tIndex.m_bEnabled )
 				continue;
+
+			if ( !tIndex.m_sGlobalIDFPath.IsEmpty() )
+				if ( !sphPrereadGlobalIDF ( tIndex.m_sGlobalIDFPath, sError ) )
+					sphWarning ( "index '%s': global IDF unavailable - IGNORING", sIndexName );
 		}
 
 		if ( eAdd!=ADD_ERROR )
@@ -19306,7 +19383,7 @@ int WINAPI ServiceMain ( int argc, char **argv )
 	bool			bOptStopWait = false;
 	bool			bOptStatus = false;
 	bool			bOptPIDFile = false;
-	const char *	sOptIndex = NULL;
+	CSphVector<const char *>	dOptIndexes;
 
 	int				iOptPort = 0;
 	bool			bOptPort = false;
@@ -19360,7 +19437,7 @@ int WINAPI ServiceMain ( int argc, char **argv )
 		OPT ( "-c", "--config" )	g_sConfigFile = argv[++i];
 		OPT ( "-p", "--port" )		{ bOptPort = true; iOptPort = atoi ( argv[++i] ); }
 		OPT ( "-l", "--listen" )	{ bOptListen = true; sOptListen = argv[++i]; }
-		OPT ( "-i", "--index" )		sOptIndex = argv[++i];
+		OPT ( "-i", "--index" )		dOptIndexes.Add ( argv[++i] );
 #if USE_WINDOWS
 		OPT1 ( "--servicename" )	++i; // it's valid but handled elsewhere
 #endif
@@ -19767,7 +19844,7 @@ int WINAPI ServiceMain ( int argc, char **argv )
 
 	// configure and preload
 
-	ConfigureAndPreload ( hConf, sOptIndex );
+	ConfigureAndPreload ( hConf, dOptIndexes );
 
 	///////////
 	// startup
@@ -20055,6 +20132,9 @@ int WINAPI ServiceMain ( int argc, char **argv )
 			SphinxqlStateRead ( g_sSphinxqlState );
 		sphUDFLock ( true );
 	}
+
+	if ( !sphThreadCreate ( &g_tRotationServiceThread, RotationServiceThreadFunc, 0 ) )
+			sphDie ( "failed to create rotation service thread" );
 
 	// almost ready, time to start listening
 	int iBacklog = hSearchd.GetInt ( "listen_backlog", SEARCHD_BACKLOG );

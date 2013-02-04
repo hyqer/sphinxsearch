@@ -282,7 +282,7 @@ function StopSearchd ( $config, $pidfile )
 	if ( file_exists($pidfile) && count(file($pidfile)) )
 	{
 		$path = $g_locals['searchd'];
-		exec ( "$path --config $config --stop" );
+		exec ( "$path --config $config --stopwait" );
 
 		$i = 0;
 		while ( file_exists ( $pidfile ) && $i < $action_retries )
@@ -2262,7 +2262,9 @@ function RunTest ( $test_dir, $skipdemo, $usemarks )
 		}
 		$config->WriteConfig ( "config.conf", "all", $msg, $config->NumAgents () < 2 );
 
-		EraseDirContents ( $index_data_path );
+		if ( !$sd_skip_indexer )
+			EraseDirContents ( $index_data_path );
+
 		if ( $config->Requires( "pre_copy_ref" ) )
 			CopyDirContents ( $test_dir . "/refdata/", "data/" );
 

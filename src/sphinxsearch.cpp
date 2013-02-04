@@ -360,6 +360,11 @@ void sphInterruptNow()
 	ExtTerm_c::m_bInterruptNow = true;
 }
 
+bool sphInterrupted()
+{
+	return ExtTerm_c::m_bInterruptNow;
+}
+
 volatile bool ExtTerm_c::m_bInterruptNow = false;
 
 /// single keyword streamer with artificial hitlist
@@ -1500,6 +1505,7 @@ ExtCached_c::ExtCached_c ( const XQNode_t * pNode, const ISphQwordSetup & tSetup
 	// this node must be only created for a huge OR of tiny expansions
 	assert ( pNode->GetOp()==SPH_QUERY_OR );
 	assert ( pNode->m_dWords.GetLength() );
+	assert ( tSetup.m_eDocinfo!=SPH_DOCINFO_INLINE );
 	ARRAY_FOREACH ( i, pNode->m_dWords )
 	{
 		assert ( pNode->m_dWords[i].m_iAtomPos==pNode->m_dWords[0].m_iAtomPos );
@@ -6356,10 +6362,10 @@ bool RankerState_Expr_fn<false>::ExtraDataImpl ( ExtraData_e eType, void ** ppRe
 	switch ( eType )
 	{
 	case EXTRA_SET_MVAPOOL:
-		m_pExpr->SetMVAPool ( (DWORD*)ppResult );
+		m_pExpr->Command ( SPH_EXPR_SET_MVA_POOL, (DWORD*)ppResult );
 		return true;
 	case EXTRA_SET_STRINGPOOL:
-		m_pExpr->SetStringPool ( (BYTE*)ppResult );
+		m_pExpr->Command ( SPH_EXPR_SET_STRING_POOL, (BYTE*)ppResult );
 		return true;
 	default:
 		return false;
@@ -6372,10 +6378,10 @@ bool RankerState_Expr_fn<true>::ExtraDataImpl ( ExtraData_e eType, void ** ppRes
 	switch ( eType )
 	{
 	case EXTRA_SET_MVAPOOL:
-		m_pExpr->SetMVAPool ( (DWORD*)ppResult );
+		m_pExpr->Command ( SPH_EXPR_SET_MVA_POOL, (DWORD*)ppResult );
 		return true;
 	case EXTRA_SET_STRINGPOOL:
-		m_pExpr->SetStringPool ( (BYTE*)ppResult );
+		m_pExpr->Command ( SPH_EXPR_SET_STRING_POOL, (BYTE*)ppResult );
 		return true;
 	case EXTRA_SET_MAXMATCHES:
 		m_iMaxMatches = *(int*)ppResult;

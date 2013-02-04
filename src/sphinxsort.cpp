@@ -123,6 +123,23 @@ public:
 // SORTING QUEUES
 //////////////////////////////////////////////////////////////////////////
 
+template < typename COMP >
+struct CompareIndex_fn
+{
+	const CSphMatch * m_pBase;
+	const CSphMatchComparatorState * m_pState;
+
+	CompareIndex_fn ( const CSphMatch * pBase, const CSphMatchComparatorState * pState )
+		: m_pBase ( pBase )
+		, m_pState ( pState )
+	{}
+
+	bool IsLess ( int a, int b ) const
+	{
+		return COMP::IsLess ( m_pBase[b], m_pBase[a], *m_pState );
+	}
+};
+
 /// heap sorter
 /// plain binary heap based PQ
 template < typename COMP, bool NOTIFICATIONS >
@@ -253,6 +270,14 @@ public:
 			Pop ();
 		}
 		m_iTotal = 0;
+	}
+
+	void BuildFlatIndexes ( CSphVector<int> & dIndexes )
+	{
+		dIndexes.Resize ( GetLength() );
+		ARRAY_FOREACH ( i, dIndexes )
+			dIndexes[i] = i;
+		dIndexes.Sort ( CompareIndex_fn<COMP> ( m_pData, &m_tState ) );
 	}
 };
 
@@ -1966,7 +1991,7 @@ public:
 	}
 
 	/// store all entries into specified location in sorted order, and remove them from queue
-	void Flatten ( CSphMatch * pTo, int iTag )
+	virtual void Flatten ( CSphMatch * pTo, int iTag )
 	{
 		assert ( m_bDataInitialized );
 
@@ -2756,8 +2781,7 @@ public:
 						ExprGeodist_t () {}
 	bool				Setup ( const CSphQuery * pQuery, const CSphSchema & tSchema, CSphString & sError );
 	virtual float		Eval ( const CSphMatch & tMatch ) const;
-	virtual void		SetMVAPool ( const DWORD * ) {}
-	virtual void		GetDependencyColumns ( CSphVector<int> & dColumns ) const;
+	virtual void		Command ( ESphExprCommand eCmd, void * pArg ) const;
 
 protected:
 	CSphAttrLocator		m_tGeoLatLoc;
@@ -2819,10 +2843,13 @@ float ExprGeodist_t::Eval ( const CSphMatch & tMatch ) const
 	return (float)(R*c);
 }
 
-void ExprGeodist_t::GetDependencyColumns ( CSphVector<int> & dColumns ) const
+void ExprGeodist_t::Command ( ESphExprCommand eCmd, void * pArg ) const
 {
-	dColumns.Add ( m_iLat );
-	dColumns.Add ( m_iLon );
+	if ( eCmd==SPH_EXPR_GET_DEPENDENT_COLS )
+	{
+		static_cast < CSphVector<int>* >(pArg)->Add ( m_iLat );
+		static_cast < CSphVector<int>* >(pArg)->Add ( m_iLon );
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -2941,7 +2968,7 @@ static bool FixupDependency ( CSphSchema & tSchema, const int * pAttrs, int iAtt
 	{
 		const CSphColumnInfo & tCol = tSchema.GetAttr ( dCur[i] );
 		if ( tCol.m_eStage>SPH_EVAL_PRESORT && tCol.m_pExpr.Ptr()!=NULL )
-			tCol.m_pExpr->GetDependencyColumns ( dCur );
+			tCol.m_pExpr->Command ( SPH_EXPR_GET_DEPENDENT_COLS, &dCur );
 	}
 
 	// get rid of dupes
@@ -2984,7 +3011,11 @@ struct ExprSortStringAttrFixup_c : public ISphExpr
 		return (int64_t)( m_pStrings && uOff ? m_pStrings + uOff : NULL );
 	}
 
-	virtual void SetStringPool ( const BYTE * pStrings ) { m_pStrings = pStrings; }
+	virtual void Command ( ESphExprCommand eCmd, void * pArg )
+	{
+		if ( eCmd==SPH_EXPR_SET_STRING_POOL )
+			m_pStrings = (const BYTE*)pArg;
+	}
 };
 
 
@@ -3089,7 +3120,11 @@ struct ExprSortJson2StringPtr_c : public ISphExpr
 		return iStriLen;
 	}
 
-	virtual void SetStringPool ( const BYTE * pStrings ) { m_pStrings = pStrings; }
+	virtual void Command ( ESphExprCommand eCmd, void * pArg )
+	{
+		if ( eCmd==SPH_EXPR_SET_STRING_POOL )
+			m_pStrings = (const BYTE*)pArg;
+	}
 };
 
 
@@ -3856,7 +3891,7 @@ ISphMatchSorter * sphCreateQueue ( const CSphQuery * pQuery, const CSphSchema & 
 				// but it might depend on some preceding columns
 				// lets detect those and move them to prefilter \ presort phase too
 				CSphVector<int> dCur;
-				tExprCol.m_pExpr->GetDependencyColumns ( dCur );
+				tExprCol.m_pExpr->Command ( SPH_EXPR_GET_DEPENDENT_COLS, &dCur );
 
 				// usual filter
 				tExprCol.m_eStage = SPH_EVAL_PREFILTER;
@@ -3870,7 +3905,7 @@ ISphMatchSorter * sphCreateQueue ( const CSphQuery * pQuery, const CSphSchema & 
 					}
 					if ( tCol.m_pExpr.Ptr() )
 					{
-						tCol.m_pExpr->GetDependencyColumns ( dCur );
+						tCol.m_pExpr->Command ( SPH_EXPR_GET_DEPENDENT_COLS, &dCur );
 					}
 				}
 				dCur.Uniq();
