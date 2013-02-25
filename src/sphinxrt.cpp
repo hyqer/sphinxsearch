@@ -18,6 +18,7 @@
 #include "sphinxrt.h"
 #include "sphinxsearch.h"
 #include "sphinxutils.h"
+#include "sphinxjson.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -772,6 +773,11 @@ struct AccDocDup_t
 	int m_iDupCount;
 };
 
+struct JSONAttr_t
+{
+	BYTE *	m_pData;
+	int		m_iLen;
+};
 
 /// indexing accumulator
 class RtAccum_t
@@ -803,7 +809,7 @@ public:
 	void			ResetDict ();
 	void			Sort ();
 
-	void			AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRowSize, const char ** ppStr, const CSphVector<DWORD> & dMvas );
+	void			AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRowSize, const char ** ppStr, const CSphVector<DWORD> & dMvas, const CSphVector<JSONAttr_t> & dJson );
 	RtSegment_t *	CreateSegment ( int iRowSize, int iWordsCheckpoint );
 	void			CleanupDuplacates ( int iRowSize );
 	void			GrabLastWarning ( CSphString & sWarning );
@@ -1041,7 +1047,7 @@ public:
 	virtual						~RtIndex_t ();
 
 	virtual bool				AddDocument ( int iFields, const char ** ppFields, const CSphMatch & tDoc, bool bReplace, const char ** ppStr, const CSphVector<DWORD> & dMvas, CSphString & sError, CSphString & sWarning );
-	virtual bool				AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, const char ** ppStr, const CSphVector<DWORD> & dMvas, CSphString & sError );
+	virtual bool				AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, const char ** ppStr, const CSphVector<DWORD> & dMvas, CSphString & sError, CSphString & sWarning );
 	virtual bool				DeleteDocument ( const SphDocID_t * pDocs, int iDocs, CSphString & sError );
 	virtual void				Commit ( int * pDeleted=NULL );
 	virtual void				RollBack ();
@@ -1381,7 +1387,7 @@ bool RtIndex_t::AddDocument ( int iFields, const char ** ppFields, const CSphMat
 	if ( !pAcc )
 		return false;
 
-	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizerIndexing->Clone ( false ) ); // avoid race
+	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizerIndexing->Clone ( SPH_CLONE_INDEX ) ); // avoid race
 	if ( m_tSettings.m_bAotFilter )
 		pTokenizer = sphAotCreateFilter ( pTokenizer.LeakPtr(), m_pDict ); // OPTIMIZE? do not create filter on each(!) INSERT
 
@@ -1411,7 +1417,13 @@ bool RtIndex_t::AddDocument ( int iFields, const char ** ppFields, const CSphMat
 
 	ISphHits * pHits = tSrc.IterateHits ( sError );
 	pAcc->GrabLastWarning ( sWarning );
-	return AddDocument ( pHits, tDoc, ppStr, dMvas, sError );
+
+	if ( !AddDocument ( pHits, tDoc, ppStr, dMvas, sError, sWarning ) )
+		return false;
+
+	m_tStats.m_iTotalBytes += tSrc.GetStats().m_iTotalBytes;
+
+	return true;
 }
 
 
@@ -1449,13 +1461,65 @@ RtAccum_t * RtIndex_t::AcquireAccum ( CSphString * sError )
 }
 
 bool RtIndex_t::AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, const char ** ppStr, const CSphVector<DWORD> & dMvas,
-	CSphString & sError )
+	CSphString & sError, CSphString & sWarning )
 {
 	assert ( g_bRTChangesAllowed );
 
 	RtAccum_t * pAcc = AcquireAccum ( &sError );
+
 	if ( pAcc )
-		pAcc->AddDocument ( pHits, tDoc, m_tSchema.GetRowSize(), ppStr, dMvas );
+	{
+		CSphVector<JSONAttr_t> dJsonData;
+
+		const CSphSchema & pSchema = GetInternalSchema();
+		int iAttr = 0;
+
+		for ( int i=0; i<pSchema.GetAttrsCount(); i++ )
+		{
+			const CSphColumnInfo & tColumn = pSchema.GetAttr(i);
+			if ( tColumn.m_eAttrType==SPH_ATTR_JSON )
+			{
+				const char * pStr = ppStr ? ppStr[iAttr] : NULL;
+				int iLen = pStr ? strlen ( pStr ) : 0;
+
+				if ( pStr && iLen )
+				{
+					// pStr originates as CSphString, so we DO have space for an extra '\0'
+					char * pData = const_cast<char*>(pStr);
+					pData[iLen+1] = '\0';
+
+					CSphVector<BYTE> dBuf;
+					if ( !sphJsonParse ( dBuf, pData, g_bJsonAutoconvNumbers, g_bJsonKeynamesToLowercase, sError ) )
+					{
+						sError.SetSprintf ( "column %s: JSON error: %s", tColumn.m_sName.cstr(), sError.cstr() );
+
+						if ( g_bJsonStrict )
+						{
+							ARRAY_FOREACH ( i, dJsonData )
+								delete [] dJsonData[i].m_pData;
+
+							return false;
+						}
+
+						if ( sWarning.IsEmpty() )
+							sWarning = sError;
+						else
+							sWarning.SetSprintf ( "%s; %s", sWarning.cstr(), sError.cstr() );
+
+						sError = "";
+					}
+
+					JSONAttr_t & tAttr = dJsonData.Add();
+					tAttr.m_iLen = dBuf.GetLength();
+					tAttr.m_pData = dBuf.LeakData();
+				}
+			}
+
+			iAttr += ( tColumn.m_eAttrType==SPH_ATTR_STRING || tColumn.m_eAttrType==SPH_ATTR_JSON ) ? 1 : 0;
+		}
+
+		pAcc->AddDocument ( pHits, tDoc, m_tSchema.GetRowSize(), ppStr, dMvas, dJsonData );
+	}
 
 	return ( pAcc!=NULL );
 }
@@ -1530,7 +1594,7 @@ void RtAccum_t::Sort ()
 	}
 }
 
-void RtAccum_t::AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRowSize, const char ** ppStr, const CSphVector<DWORD> & dMvas )
+void RtAccum_t::AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRowSize, const char ** ppStr, const CSphVector<DWORD> & dMvas, const CSphVector<JSONAttr_t> & dJson )
 {
 	MEMORY ( SPH_MEM_IDX_RT_ACCUM );
 
@@ -1558,18 +1622,25 @@ void RtAccum_t::AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRow
 
 	const CSphSchema & pSchema = m_pIndex->GetInternalSchema();
 	int iAttr = 0;
+	int iJsonAttr = 0;
 	for ( int i=0; i<pSchema.GetAttrsCount(); i++ )
 	{
+		bool bJsonCleanup = false;
 		const CSphColumnInfo & tColumn = pSchema.GetAttr(i);
 		if ( tColumn.m_eAttrType==SPH_ATTR_STRING || tColumn.m_eAttrType==SPH_ATTR_JSON )
 		{
 			const char * pStr = ppStr ? ppStr[iAttr++] : NULL;
-			const int iLen = pStr ? strlen ( pStr ) : 0;
+			int iLen = pStr ? strlen ( pStr ) : 0;
 
-			// FIXME! might need to add some json conversion magic here,
-			// but how would be go about reporting errors?
+			CSphVector<BYTE> dBuf;
+			if ( pStr && iLen && tColumn.m_eAttrType==SPH_ATTR_JSON )
+			{
+				pStr = (const char*)dJson[iJsonAttr].m_pData;
+				iLen = dJson[iJsonAttr].m_iLen;
+				bJsonCleanup = true;
+			}
 
-			if ( iLen )
+			if ( pStr && iLen )
 			{
 				BYTE dLen[3];
 				const int iLenPacked = sphPackStrlen ( dLen, iLen );
@@ -1583,6 +1654,9 @@ void RtAccum_t::AddDocument ( ISphHits * pHits, const CSphMatch & tDoc, int iRow
 			{
 				sphSetRowAttr ( pAttrs, tColumn.m_tLocator, 0 );
 			}
+
+			if ( bJsonCleanup )
+				delete [] dJson[iJsonAttr++].m_pData;
 		} else if ( tColumn.m_eAttrType==SPH_ATTR_UINT32SET || tColumn.m_eAttrType==SPH_ATTR_INT64SET )
 		{
 			assert ( m_dMvas.GetLength() );
@@ -4156,7 +4230,7 @@ void RtIndex_t::PostSetup()
 		m_tSettings.m_dBigramWords.Sort();
 	}
 	// FIXME!!! handle error
-	m_pTokenizerIndexing = m_pTokenizer->Clone ( false );
+	m_pTokenizerIndexing = m_pTokenizer->Clone ( SPH_CLONE_INDEX );
 	ISphTokenizer * pIndexing = ISphTokenizer::CreateBigramFilter ( m_pTokenizerIndexing, m_tSettings.m_eBigramIndex, m_tSettings.m_sBigramWords, m_sLastError );
 	if ( pIndexing )
 		m_pTokenizerIndexing = pIndexing;
@@ -5603,7 +5677,9 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 	const_cast<CSphQuery*> ( pQuery )->m_eMode = SPH_MATCH_EXTENDED2;
 
 	// wrappers
-	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizer->Clone ( false ) );
+	// OPTIMIZE! make a lightweight clone here? and/or remove double clone?
+	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizer->Clone ( SPH_CLONE_QUERY ) );
+	sphSetupQueryTokenizer ( pTokenizer.Ptr() );
 
 	CSphScopedPtr<CSphDict> tDictCloned ( NULL );
 	CSphDict * pDict = m_pDict;
@@ -6027,7 +6103,7 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 	for ( int i=0; i<pResult->m_tSchema.GetAttrsCount(); i++ )
 	{
 		const CSphColumnInfo & tSetInfo = pResult->m_tSchema.GetAttr(i);
-		if ( tSetInfo.m_eAttrType==SPH_ATTR_STRING )
+		if ( tSetInfo.m_eAttrType==SPH_ATTR_STRING || tSetInfo.m_eAttrType==SPH_ATTR_JSON )
 		{
 			const int iInLocator = m_tSchema.GetAttrIndex ( tSetInfo.m_sName.cstr() );
 			assert ( iInLocator>=0 );
@@ -6229,7 +6305,7 @@ bool RtIndex_t::GetKeywords ( CSphVector<CSphKeywordInfo> & dKeywords, const cha
 	RtQword_t tQword;
 	CSphString sBuffer ( sQuery );
 
-	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizer->Clone ( false ) ); // avoid race
+	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizer->Clone ( SPH_CLONE_INDEX ) ); // avoid race
 	pTokenizer->SetBuffer ( (BYTE *)sBuffer.cstr(), sBuffer.Length() );
 
 	CSphScopedPtr<CSphDict> tDictCloned ( NULL );
@@ -6634,7 +6710,7 @@ bool RtIndex_t::AttachDiskIndex ( CSphIndex * pIndex, CSphString & sError )
 	m_tSettings.m_dBigramWords.Reset();
 	m_tSettings.m_eDocinfo = SPH_DOCINFO_EXTERN;
 
-	m_pTokenizer = pIndex->GetTokenizer()->Clone ( false );
+	m_pTokenizer = pIndex->GetTokenizer()->Clone ( SPH_CLONE_INDEX );
 	m_pDict = pIndex->GetDictionary()->Clone ();
 	PostSetup();
 
@@ -8092,7 +8168,6 @@ void sphRTInit ()
 	MEMORY ( SPH_MEM_BINLOG );
 
 	g_bRTChangesAllowed = false;
-	Verify ( RtSegment_t::m_tSegmentSeq.Init() );
 	Verify ( sphThreadKeyCreate ( &g_tTlsAccumKey ) );
 
 	g_pRtBinlog = new RtBinlog_c();
@@ -8117,7 +8192,6 @@ void sphRTConfigure ( const CSphConfigSection & hSearchd, bool bTestMode )
 void sphRTDone ()
 {
 	sphThreadKeyDelete ( g_tTlsAccumKey );
-	Verify ( RtSegment_t::m_tSegmentSeq.Done() );
 	// its valid for "searchd --stop" case
 	SafeDelete ( g_pBinlog );
 }

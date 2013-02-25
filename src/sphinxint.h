@@ -75,9 +75,124 @@ extern int g_iPredictorCostDoc;
 extern int g_iPredictorCostHit;
 extern int g_iPredictorCostMatch;
 
+extern bool g_bJsonStrict;
+extern bool g_bJsonAutoconvNumbers;
+extern bool g_bJsonKeynamesToLowercase;
+
 //////////////////////////////////////////////////////////////////////////
 // INTERNAL HELPER FUNCTIONS, CLASSES, ETC
 //////////////////////////////////////////////////////////////////////////
+
+
+/// some low-level query stats
+struct CSphQueryStats
+{
+	int64_t *	m_pNanoBudget;		///< pointer to max_predicted_time budget (counted in nanosec)
+	DWORD		m_iFetchedDocs;		///< processed documents
+	DWORD		m_iFetchedHits;		///< processed hits (aka positions)
+	DWORD		m_iSkips;			///< number of Skip() calls
+
+	CSphQueryStats()
+		: m_pNanoBudget ( NULL )
+		, m_iFetchedDocs ( 0 )
+		, m_iFetchedHits ( 0 )
+		, m_iSkips ( 0 )
+	{}
+};
+
+
+#define SPH_QUERY_STATES \
+	SPH_QUERY_STATE ( UNKNOWN,		"unknown" ) \
+	SPH_QUERY_STATE ( NET_READ,		"net_read" ) \
+	SPH_QUERY_STATE ( IO,			"io" ) \
+	SPH_QUERY_STATE ( DIST_CONNECT,	"dist_connect" ) \
+	SPH_QUERY_STATE ( SQL_PARSE,	"sql_parse" ) \
+	SPH_QUERY_STATE ( DICT_SETUP,	"dict_setup" ) \
+	SPH_QUERY_STATE ( PARSE,		"parse" ) \
+	SPH_QUERY_STATE ( TRANSFORMS,	"transforms" ) \
+	SPH_QUERY_STATE ( INIT,			"init" ) \
+	SPH_QUERY_STATE ( OPEN,			"open" ) \
+	SPH_QUERY_STATE ( READ_DOCS,	"read_docs" ) \
+	SPH_QUERY_STATE ( READ_HITS,	"read_hits" ) \
+	SPH_QUERY_STATE ( GET_DOCS,		"get_docs" ) \
+	SPH_QUERY_STATE ( GET_HITS,		"get_hits" ) \
+	SPH_QUERY_STATE ( FILTER,		"filter" ) \
+	SPH_QUERY_STATE ( RANK,			"rank" ) \
+	SPH_QUERY_STATE ( SORT,			"sort" ) \
+	SPH_QUERY_STATE ( FINALIZE,		"finalize" ) \
+	SPH_QUERY_STATE ( DIST_WAIT,	"dist_wait" ) \
+	SPH_QUERY_STATE ( AGGREGATE,	"aggregate" ) \
+	SPH_QUERY_STATE ( NET_WRITE,	"net_write" ) \
+	SPH_QUERY_STATE ( EVAL_POST,	"eval_post" ) \
+	SPH_QUERY_STATE ( SNIPPET,		"eval_snippet" ) \
+	SPH_QUERY_STATE ( EVAL_UDF,		"eval_udf" )
+
+
+/// possible query states, used for profiling
+enum ESphQueryState
+{
+	SPH_QSTATE_INFINUM = -1,
+
+#define SPH_QUERY_STATE(_name,_desc) SPH_QSTATE_##_name,
+	SPH_QUERY_STATES
+#undef SPH_QUERY_STATE
+
+	SPH_QSTATE_TOTAL
+};
+STATIC_ASSERT ( SPH_QSTATE_UNKNOWN==0, BAD_QUERY_STATE_ENUM_BASE );
+
+
+/// search query profile
+class CSphQueryProfile
+{
+public:
+	ESphQueryState	m_eState;							///< current state
+	int64_t			m_tmStamp;							///< timestamp when we entered the current state
+
+	int				m_dSwitches [ SPH_QSTATE_TOTAL+1 ];	///< number of switches to given state
+	int64_t			m_tmTotal [ SPH_QSTATE_TOTAL+1 ];	///< total time spent per state
+	CSphQueryStats	m_tStats;							///< query prediction counters
+	bool			m_bHasPrediction;					///< is prediction counters set?
+
+public:
+	/// create empty and stopped profile
+	CSphQueryProfile()
+	{
+		Start ( SPH_QSTATE_TOTAL );
+	}
+
+	/// switch to a new query state, and record a timestamp
+	/// returns previous state, to simplify Push/Pop like scenarios
+	ESphQueryState Switch ( ESphQueryState eNew )
+	{
+		int64_t tmNow = sphMicroTimer();
+		ESphQueryState eOld = m_eState;
+		m_dSwitches [ eOld ]++;
+		m_tmTotal [ eOld ] += tmNow - m_tmStamp;
+		m_eState = eNew;
+		m_tmStamp = tmNow;
+		return eOld;
+	}
+
+	/// reset everything and start profiling from a given state
+	void Start ( ESphQueryState eNew )
+	{
+		memset ( m_dSwitches, 0, sizeof(m_dSwitches) );
+		memset ( m_tmTotal, 0, sizeof(m_tmTotal) );
+		m_eState = eNew;
+		m_tmStamp = sphMicroTimer();
+
+		m_tStats = CSphQueryStats();
+		m_bHasPrediction = false;
+	}
+
+	/// stop profiling
+	void Stop()
+	{
+		Switch ( SPH_QSTATE_TOTAL );
+	}
+};
+
 
 /// file writer with write buffering and int encoder
 class CSphWriter : ISphNoncopyable
@@ -172,6 +287,10 @@ public:
 /// file reader with read buffering and int decoder
 class CSphReader
 {
+public:
+	CSphQueryProfile *	m_pProfile;
+	ESphQueryState		m_eProfileState;
+
 public:
 	CSphReader ( BYTE * pBuf=NULL, int iSize=0 );
 	virtual		~CSphReader ();
@@ -290,6 +409,7 @@ public:
 	CSphVector<CSphAttrLocator>				m_dOverrideOut;
 
 	void *						m_pIndexData;			///< backend specific data
+	CSphQueryProfile *			m_pProfile;
 
 public:
 	CSphQueryContext ();
@@ -906,6 +1026,32 @@ inline int sphUTF8Decode ( BYTE * & pBuf )
 }
 
 
+/// encode UTF-8 codepoint to buffer, macro version for the Really Critical places
+#define SPH_UTF8_ENCODE(_ptr,_code) \
+	if ( (_code)<0x80 ) \
+	{ \
+		*_ptr++ = (BYTE)( (_code) & 0x7F ); \
+	} else if ( (_code)<0x800 ) \
+	{ \
+		_ptr[0] = (BYTE)( ( ((_code)>>6) & 0x1F ) | 0xC0 ); \
+		_ptr[1] = (BYTE)( ( (_code) & 0x3F ) | 0x80 ); \
+		_ptr += 2; \
+	} else if ( (_code)<0x8000 )\
+	{ \
+		_ptr[0] = (BYTE)( ( ((_code)>>12) & 0x0F ) | 0xE0 ); \
+		_ptr[1] = (BYTE)( ( ((_code)>>6) & 0x3F ) | 0x80 ); \
+		_ptr[2] = (BYTE)( ( (_code) & 0x3F ) | 0x80 ); \
+		_ptr += 3; \
+	} else \
+	{ \
+		_ptr[0] = (BYTE)( ( ((_code)>>18) & 0x0F ) | 0xF0 ); \
+		_ptr[1] = (BYTE)( ( ((_code)>>12) & 0x3F ) | 0x80 ); \
+		_ptr[2] = (BYTE)( ( ((_code)>>6) & 0x3F ) | 0x80 ); \
+		_ptr[3] = (BYTE)( ( (_code) & 0x3F ) | 0x80 ); \
+		_ptr += 4; \
+	}
+
+
 /// encode UTF-8 codepoint to buffer
 /// returns number of bytes used
 inline int sphUTF8Encode ( BYTE * pBuf, int iCode )
@@ -921,12 +1067,19 @@ inline int sphUTF8Encode ( BYTE * pBuf, int iCode )
 		pBuf[1] = (BYTE)( ( iCode & 0x3F ) | 0x80 );
 		return 2;
 
-	} else
+	} else if ( iCode<0x8000 )
 	{
 		pBuf[0] = (BYTE)( ( (iCode>>12) & 0x0F ) | 0xE0 );
 		pBuf[1] = (BYTE)( ( (iCode>>6) & 0x3F ) | 0x80 );
 		pBuf[2] = (BYTE)( ( iCode & 0x3F ) | 0x80 );
 		return 3;
+	} else
+	{
+		pBuf[0] = (BYTE)( ( (iCode>>18) & 0x0F ) | 0xF0 );
+		pBuf[1] = (BYTE)( ( (iCode>>12) & 0x3F ) | 0x80 );
+		pBuf[2] = (BYTE)( ( (iCode>>6) & 0x3F ) | 0x80 );
+		pBuf[3] = (BYTE)( ( iCode & 0x3F ) | 0x80 );
+		return 4;
 	}
 }
 
@@ -1204,7 +1357,6 @@ public:
 
 	virtual int						GetCodepointLength ( int iCode ) const		{ return m_pTokenizer->GetCodepointLength ( iCode ); }
 	virtual int						GetMaxCodepointLength () const				{ return m_pTokenizer->GetMaxCodepointLength(); }
-	virtual void					EnableQueryParserMode ( bool bEnable )		{ m_pTokenizer->EnableQueryParserMode ( bEnable ); }
 
 	virtual bool					IsUtf8 () const								{ return m_pTokenizer->IsUtf8 (); }
 	virtual const char *			GetTokenStart () const						{ return m_pTokenizer->GetTokenStart(); }
@@ -1527,7 +1679,6 @@ class SnippetContext_t : ISphNoncopyable
 private:
 	CSphScopedPtr<CSphDict> m_tDictCloned;
 	CSphScopedPtr<CSphDict> m_tExactDict;
-	CSphScopedPtr<ISphTokenizer> m_tQueryTokenizer;
 
 public:
 	CSphDict * m_pDict;
@@ -1540,7 +1691,6 @@ public:
 	SnippetContext_t()
 		: m_tDictCloned ( NULL )
 		, m_tExactDict ( NULL )
-		, m_tQueryTokenizer ( NULL )
 		, m_pDict ( NULL )
 		, m_tTokenizer ( NULL )
 		, m_tStripper ( NULL )
@@ -1549,15 +1699,20 @@ public:
 	{
 	}
 
+	~SnippetContext_t()
+	{
+		SafeDelete ( m_pQueryTokenizer );
+	}
+
 	static CSphDict * SetupExactDict ( const CSphIndexSettings & tSettings, const ExcerptQuery_t & q,
-		CSphScopedPtr<CSphDict> & tExact, CSphDict * pDict, ISphTokenizer * pTokenizer )
+		CSphScopedPtr<CSphDict> & tExact, CSphDict * pDict, ISphTokenizer * pTok )
 	{
 		// handle index_exact_words
 		if ( !( q.m_bHighlightQuery && tSettings.m_bIndexExactWords ) )
 			return pDict;
 
-		pTokenizer->AddPlainChar ( '=' );
 		tExact = new CSphDictExact ( pDict );
+		pTok->AddPlainChar ( '=' );
 		return tExact.Ptr();
 	}
 
@@ -1629,17 +1784,16 @@ public:
 		m_pDict = pIndex->GetDictionary();
 		if ( m_pDict->HasState() )
 			m_tDictCloned = m_pDict = m_pDict->Clone();
-
-		m_tTokenizer = pIndex->GetTokenizer()->Clone ( true );
-		m_pQueryTokenizer = m_tTokenizer.Ptr();
+		m_tTokenizer = pIndex->GetTokenizer()->Clone ( SPH_CLONE_INDEX ); // OPTIMIZE! do a lightweight indexing clone here
+		m_pQueryTokenizer = pIndex->GetQueryTokenizer()->Clone ( SPH_CLONE_QUERY_LIGHTWEIGHT );
 
 		// setup exact dictionary if needed
 		m_pDict = SetupExactDict ( pIndex->GetSettings(), tSettings, m_tExactDict, m_pDict, m_tTokenizer.Ptr() );
-		// TODO!!! check star dict too
 
 		if ( tSettings.m_bHighlightQuery )
 		{
-			if ( !sphParseExtendedQuery ( m_tExtQuery, tSettings.m_sWords.cstr(), m_pQueryTokenizer,
+			// OPTIMIZE? double lightweight clone here? but then again it's lightweight
+			if ( !sphParseExtendedQuery ( m_tExtQuery, tSettings.m_sWords.cstr(), pIndex->GetQueryTokenizer(),
 				&pIndex->GetMatchSchema(), m_pDict, pIndex->GetSettings() ) )
 			{
 				sError = m_tExtQuery.m_sParseError;
@@ -1659,12 +1813,6 @@ public:
 
 		if ( !SetupStripperSPZ ( pIndex->GetSettings(), tSettings, bSetupSPZ, m_tStripper, m_tTokenizer.Ptr(), sError ) )
 			return false;
-
-		if ( bSetupSPZ )
-		{
-			m_tQueryTokenizer = pIndex->GetTokenizer()->Clone ( true );
-			m_pQueryTokenizer = m_tQueryTokenizer.Ptr();
-		}
 
 		return true;
 	}

@@ -73,8 +73,7 @@ bool CreateSynonymsFile ( const char * sMagic )
 
 
 const DWORD TOK_EXCEPTIONS		= 1;
-const DWORD TOK_ESCAPED			= 2;
-const DWORD TOK_NO_DASH			= 4;
+const DWORD TOK_NO_DASH			= 2;
 
 ISphTokenizer * CreateTestTokenizer ( bool bUTF8, DWORD uMode )
 {
@@ -82,6 +81,7 @@ ISphTokenizer * CreateTestTokenizer ( bool bUTF8, DWORD uMode )
 	CSphTokenizerSettings tSettings;
 	tSettings.m_iType = bUTF8 ? TOKENIZER_UTF8 : TOKENIZER_SBCS;
 	tSettings.m_iMinWordLen = 2;
+
 	ISphTokenizer * pTokenizer = ISphTokenizer::Create ( tSettings, NULL, sError );
 	if (!( uMode & TOK_NO_DASH ))
 	{
@@ -92,18 +92,18 @@ ISphTokenizer * CreateTestTokenizer ( bool bUTF8, DWORD uMode )
 		assert ( pTokenizer->SetCaseFolding ( "0..9, A..Z->a..z, _, a..z, U+80..U+FF", sError ) );
 		pTokenizer->AddSpecials ( "!" );
 	}
-	pTokenizer->EnableQueryParserMode ( true );
 	if ( uMode & TOK_EXCEPTIONS )
 		assert ( pTokenizer->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
 
-	if ( uMode & TOK_ESCAPED )
-	{
-		ISphTokenizer * pOldTokenizer = pTokenizer;
-		pTokenizer = pTokenizer->Clone ( true );
-		SafeDelete ( pOldTokenizer );
-	}
+	// tricky little shit!
+	// we want to create a query mode tokenizer
+	// the official way is to Clone() an indexing mode one, so we do that
+	// however, Clone() adds backslash as a special
+	// and that must be done *after* SetCaseFolding, otherwise it's not special any more
+	ISphTokenizer * pTokenizer1 = pTokenizer->Clone ( SPH_CLONE_QUERY );
+	SafeDelete ( pTokenizer );
 
-	return pTokenizer;
+	return pTokenizer1;
 }
 
 
@@ -122,8 +122,7 @@ void TestTokenizer ( bool bUTF8 )
 
 		assert ( CreateSynonymsFile ( sMagic ) );
 		bool bExceptions = ( iRun>=2 );
-		bool bEscaped = ( iRun==3 );
-		ISphTokenizer * pTokenizer = CreateTestTokenizer ( bUTF8, bExceptions*TOK_EXCEPTIONS + bEscaped*TOK_ESCAPED );
+		ISphTokenizer * pTokenizer = CreateTestTokenizer ( bUTF8, bExceptions*TOK_EXCEPTIONS );
 
 		const char * dTests[] =
 		{
@@ -242,14 +241,12 @@ void TestTokenizer ( bool bUTF8 )
 
 		// test short word callbacks
 		printf ( "%s for short token handling\n", sPrefix );
-		ISphTokenizer * pShortTokenizer = pTokenizer->Clone ( bEscaped );
+		ISphTokenizer * pShortTokenizer = pTokenizer->Clone ( SPH_CLONE_QUERY );
 		pShortTokenizer->AddPlainChar ( '*' );
 
 		CSphTokenizerSettings tSettings = pShortTokenizer->GetSettings();
 		tSettings.m_iMinWordLen = 5;
 		pShortTokenizer->Setup ( tSettings );
-
-		pShortTokenizer->EnableQueryParserMode ( true );
 
 		const char * dTestsShort[] =
 		{
@@ -345,9 +342,9 @@ void TestTokenizer ( bool bUTF8 )
 	printf ( "%s vs escaping vs blend_chars edge cases\n", sPrefix );
 
 	CSphString sError;
-	ISphTokenizer * pTokenizer = CreateTestTokenizer ( bUTF8, TOK_ESCAPED );
-	pTokenizer->AddSpecials ( "()!-\"" );
-	assert ( pTokenizer->SetBlendChars ( ".", sError ) );
+	ISphTokenizer * pTokenizer = CreateTestTokenizer ( bUTF8, 0 );
+	assert ( pTokenizer->SetBlendChars ( "., @", sError ) );
+	pTokenizer->AddSpecials ( "()!-\"@" );
 
 	char sTest1[] = "(texas.\\\")";
 	pTokenizer->SetBuffer ( (BYTE*)sTest1, strlen(sTest1) );
@@ -386,18 +383,57 @@ void TestTokenizer ( bool bUTF8 )
 	assert ( !pTokenizer->TokenIsBlended() );
 	assert ( !pTokenizer->TokenIsBlendedPart() );
 
+	char sTest4[] = "3.rd text";
+	printf ( "test %s\n", sTest4 );
+	pTokenizer->SetBuffer ( (BYTE*)sTest4, strlen(sTest4) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "3.rd" ) );
+	assert ( pTokenizer->TokenIsBlended() );
+	assert ( pTokenizer->SkipBlended()==1 );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "text" ) );
+	assert ( !pTokenizer->TokenIsBlended() );
+	assert ( !pTokenizer->GetToken() );
+
+	char sTest5[] = "123\\@rd text";
+	printf ( "test %s\n", sTest5 );
+	pTokenizer->SetBuffer ( (BYTE*)sTest5, strlen(sTest5) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "123@rd" ) );
+	assert ( pTokenizer->TokenIsBlended() );
+	assert ( pTokenizer->SkipBlended()==2 );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "text" ) );
+	assert ( !pTokenizer->TokenIsBlended() );
+	assert ( !pTokenizer->GetToken() );
+
+	char sTest6[] = "at.ta\\.c.da\\.bl.ok yo pest";
+	printf ( "test %s\n", sTest6 );
+	pTokenizer->SetBuffer ( (BYTE*)sTest6, strlen(sTest6) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "at.ta.c.da.bl.ok" ) );
+	assert ( pTokenizer->TokenIsBlended() );
+	assert ( pTokenizer->SkipBlended()==5 );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "yo" ) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "pest" ) );
+	assert ( !pTokenizer->GetToken() );
+
+	char sTest7[] = "3\\@rd text";
+	printf ( "test %s\n", sTest7 );
+	pTokenizer->SetBuffer ( (BYTE*)sTest7, strlen(sTest7) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "3@rd" ) );
+	assert ( pTokenizer->TokenIsBlended() );
+	assert ( pTokenizer->SkipBlended()==1 ); // because 3 is overshort!
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "text" ) );
+	assert ( !pTokenizer->TokenIsBlended() );
+	assert ( !pTokenizer->GetToken() );
+
 	// blended/special vs query mode vs modifier.. hell, this is complicated
 	SafeDelete ( pTokenizer );
 	pTokenizer = CreateTestTokenizer ( bUTF8, TOK_NO_DASH );
 	assert ( pTokenizer->SetBlendChars ( "., -", sError ) );
 	pTokenizer->AddSpecials ( "-" );
 	pTokenizer->AddPlainChar ( '=' );
-	pTokenizer->EnableQueryParserMode ( true );
 	assert ( pTokenizer->SetBlendMode ( "trim_none, skip_pure", sError ) );
 
-	char sTest4[] = "hello =- =world";
-	printf ( "test %s\n", sTest4 );
-	pTokenizer->SetBuffer ( (BYTE*)sTest4, strlen(sTest4) );
+	char sTest10[] = "hello =- =world";
+	printf ( "test %s\n", sTest10 );
+	pTokenizer->SetBuffer ( (BYTE*)sTest10, strlen(sTest10) );
 
 	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "hello" ) );
 	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "=world" ) );
@@ -409,6 +445,58 @@ void TestTokenizer ( bool bUTF8 )
 
 	printf ( "test utf8 len 2\n" );
 	assert ( sphUTF8Len ( "", 256 )==0 && sphUTF8Len ( NULL, 256 )==0 );
+
+	printf ( "test noascii case\n" );
+	pTokenizer = sphCreateUTF8Tokenizer();
+	assert ( pTokenizer->SetCaseFolding ( "U+410..U+42F->U+430..U+44F, U+430..U+44F, U+401->U+451, U+451", sError ) );
+	char sTest20[] = "abc \xD0\xBE\xD0\xBF\xD0\xB0\x58\xD1\x87\xD0\xB0 def";
+	pTokenizer->SetBuffer ( (BYTE*)sTest20, strlen(sTest20) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "\xD0\xBE\xD0\xBF\xD0\xB0" ) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "\xD1\x87\xD0\xB0" ) );
+	assert ( !pTokenizer->GetToken() );
+	SafeDelete ( pTokenizer );
+	printf ( "test utf8 4-bytes codepoint\n" );
+	BYTE sTest21[] = "\xF4\x80\x80\x80\x32\x34\x20";
+	BYTE sRes21[SPH_MAX_WORD_LEN];
+
+	memset ( sRes21, 0, sizeof(sRes21) );
+	BYTE * pTest21 = sTest21;
+	int iCode21 = sphUTF8Decode ( pTest21 );
+	assert ( sphUTF8Encode ( sRes21, iCode21 )==4 );
+	assert ( sTest21[0]==sRes21[0] && sTest21[1]==sRes21[1] && sTest21[2]==sRes21[2] && sTest21[3]==sRes21[3] );
+	memset ( sRes21, 0, sizeof(sRes21) );
+	BYTE * pRes21 = sRes21;
+	SPH_UTF8_ENCODE ( pRes21, iCode21 );
+	assert ( sTest21[0]==sRes21[0] && sTest21[1]==sRes21[1] && sTest21[2]==sRes21[2] && sTest21[3]==sRes21[3] );
+
+	pTokenizer = sphCreateUTF8Tokenizer();
+	pTokenizer->SetBuffer ( (BYTE*)sTest21, sizeof(sTest21) );
+	assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "\xF4\x80\x80\x80\x32\x34" ) );
+}
+
+
+char * LoadFile ( const char * sName, int * pLen, bool bReportErrors )
+{
+	FILE * fp = fopen ( sName, "rb" );
+	if ( !fp )
+	{
+		if ( bReportErrors )
+			printf ( "benchmark failed: error opening %s\n", sName );
+		return NULL;
+	}
+	const int MAX_DATA = 10485760;
+	char * sData = new char [ MAX_DATA ];
+	int iData = fread ( sData, 1, MAX_DATA, fp );
+	fclose ( fp );
+	if ( iData<=0 )
+	{
+		if ( bReportErrors )
+			printf ( "benchmark failed: error reading %s\n", sName );
+		SafeDeleteArray ( sData );
+		return NULL;
+	}
+	*pLen = iData;
+	return sData;
 }
 
 
@@ -421,28 +509,12 @@ void BenchTokenizer ( bool bUTF8 )
 		return;
 	}
 
-
-	const char * sTestfile = "./configure";
+	CSphString sError;
 	for ( int iRun=1; iRun<=2; iRun++ )
 	{
-		FILE * fp = fopen ( sTestfile, "rb" );
-		if ( !fp )
-		{
-			printf ( "benchmark failed: error opening %s\n", sTestfile );
-			return;
-		}
-		const int MAX_DATA = 10485760;
-		char * sData = new char [ MAX_DATA ];
-		int iData = fread ( sData, 1, MAX_DATA, fp );
-		fclose ( fp );
-		if ( iData<=0 )
-		{
-			printf ( "benchmark failed: error reading %s\n", sTestfile );
-			SafeDeleteArray ( sData );
-			return;
-		}
+		int iData;
+		char * sData = LoadFile ( "./configure", &iData, true );
 
-		CSphString sError;
 		ISphTokenizer * pTokenizer = bUTF8 ? sphCreateUTF8Tokenizer () : sphCreateSBCSTokenizer ();
 		pTokenizer->SetCaseFolding ( "-, 0..9, A..Z->a..z, _, a..z", sError );
 		if ( iRun==2 )
@@ -467,6 +539,35 @@ void BenchTokenizer ( bool bUTF8 )
 			(int)(tmTime/1000), (int)(tmTime%1000), float(iData)/tmTime );
 		SafeDeleteArray ( sData );
 	}
+
+	if ( !bUTF8 )
+		return;
+
+	int iData;
+	char * sData = LoadFile ( "./utf8.txt", &iData, false );
+	if ( sData )
+	{
+		ISphTokenizer * pTokenizer = sphCreateUTF8Tokenizer ();
+
+		const int iPasses = 200;
+		int iTokens = 0;
+
+		int64_t tmTime = -sphMicroTimer();
+		for ( int iPass=0; iPass<iPasses; iPass++ )
+		{
+			pTokenizer->SetBuffer ( (BYTE*)sData, iData );
+			while ( pTokenizer->GetToken() )
+				iTokens++;
+		}
+		tmTime += sphMicroTimer();
+
+		iTokens /= iPasses;
+		tmTime /= iPasses;
+
+		printf ( "run 3: %d bytes, %d tokens, %d.%03d ms, %.3f MB/sec\n", iData, iTokens,
+			(int)(tmTime/1000), (int)(tmTime%1000), float(iData)/tmTime );
+	}
+	SafeDeleteArray ( sData );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -645,7 +746,7 @@ void TestExpr ()
 		printf ( "testing expression evaluation, test %d/%d... ", 1+iTest, nTests );
 
 		CSphString sError;
-		CSphScopedPtr<ISphExpr> pExpr ( sphExprParse ( dTests[iTest].m_sExpr, tSchema, NULL, NULL, sError ) );
+		CSphScopedPtr<ISphExpr> pExpr ( sphExprParse ( dTests[iTest].m_sExpr, tSchema, NULL, NULL, sError, NULL ) );
 		if ( !pExpr.Ptr() )
 		{
 			printf ( "FAILED; %s\n", sError.cstr() );
@@ -720,7 +821,7 @@ void BenchExpr ()
 
 		ESphAttr uType;
 		CSphString sError;
-		CSphScopedPtr<ISphExpr> pExpr ( sphExprParse ( dBench[iRun].m_sExpr, tSchema, &uType, NULL, sError ) );
+		CSphScopedPtr<ISphExpr> pExpr ( sphExprParse ( dBench[iRun].m_sExpr, tSchema, &uType, NULL, sError, NULL ) );
 		if ( !pExpr.Ptr() )
 		{
 			printf ( "FAILED; %s\n", sError.cstr() );
@@ -762,25 +863,29 @@ void BenchExpr ()
 
 void TestQueryParser ()
 {
+	CSphString sError;
+
 	CSphSchema tSchema;
 	CSphColumnInfo tCol;
 	tCol.m_sName = "title"; tSchema.m_dFields.Add ( tCol );
 	tCol.m_sName = "body"; tSchema.m_dFields.Add ( tCol );
 
-	CSphString sError;
-	CSphDictSettings tDictSettings;
-	CSphScopedPtr<ISphTokenizer> pTokenizer ( sphCreateSBCSTokenizer () );
-	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query", sError ) );
-	assert ( pTokenizer.Ptr() );
-	assert ( pDict.Ptr() );
-
+	CSphScopedPtr<ISphTokenizer> pBase ( sphCreateSBCSTokenizer () );
 	CSphTokenizerSettings tTokenizerSetup;
 	tTokenizerSetup.m_iMinWordLen = 2;
 	tTokenizerSetup.m_sSynonymsFile = g_sTmpfile;
-	pTokenizer->Setup ( tTokenizerSetup );
-
+	pBase->Setup ( tTokenizerSetup );
 	assert ( CreateSynonymsFile ( NULL ) );
-	assert ( pTokenizer->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
+	assert ( pBase->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
+
+	CSphScopedPtr<ISphTokenizer> pTokenizer ( pBase->Clone ( SPH_CLONE_QUERY ) );
+	sphSetupQueryTokenizer ( pTokenizer.Ptr() );
+
+	CSphDictSettings tDictSettings;
+	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query", sError ) );
+
+	assert ( pTokenizer.Ptr() );
+	assert ( pDict.Ptr() );
 
 	struct QueryTest_t
 	{
@@ -899,19 +1004,22 @@ void TestQueryTransforms ()
 
 	CSphString sError;
 	CSphDictSettings tDictSettings;
-	CSphScopedPtr<ISphTokenizer> pTokenizer ( sphCreateSBCSTokenizer () );
-	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pTokenizer.Ptr(), "query", sError ) );
-	assert ( pTokenizer.Ptr() );
+	CSphScopedPtr<ISphTokenizer> pBase ( sphCreateSBCSTokenizer () );
+	CSphScopedPtr<CSphDict> pDict ( sphCreateDictionaryCRC ( tDictSettings, NULL, pBase.Ptr(), "query", sError ) );
+	assert ( pBase.Ptr() );
 	assert ( pDict.Ptr() );
 	assert ( sError.IsEmpty() );
 
 	CSphTokenizerSettings tTokenizerSetup;
 	tTokenizerSetup.m_iMinWordLen = 2;
 	tTokenizerSetup.m_sSynonymsFile = g_sTmpfile;
-	pTokenizer->Setup ( tTokenizerSetup );
+	pBase->Setup ( tTokenizerSetup );
 
 	assert ( CreateSynonymsFile ( NULL ) );
-	assert ( pTokenizer->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
+	assert ( pBase->LoadSynonyms ( g_sTmpfile, NULL, sError ) );
+
+	CSphScopedPtr<ISphTokenizer> pTokenizer ( pBase->Clone ( SPH_CLONE_QUERY ) );
+	sphSetupQueryTokenizer ( pTokenizer.Ptr() );
 
 	struct CKeywordHits {
 		const char * 	m_sKeyword;
@@ -2075,7 +2183,7 @@ void TestRTWeightBoundary ()
 		printf ( "testing rt indexing, test %d/%d... ", 1+iPass, RT_PASS_COUNT );
 		TestRTInit ();
 
-		CSphString sError;
+		CSphString sError, sWarning;
 		CSphDictSettings tDictSettings;
 
 		ISphTokenizer * pTok = sphCreateUTF8Tokenizer();
@@ -2121,7 +2229,7 @@ void TestRTWeightBoundary ()
 		// in favor of tokenizer/dict loaded from the saved settings in meta
 		// however, source still needs those guys!
 		// so for simplicity i just clone them
-		pIndex->SetTokenizer ( pTok->Clone ( false ) );
+		pIndex->SetTokenizer ( pTok->Clone ( SPH_CLONE_INDEX ) );
 		pIndex->SetDictionary ( pDict->Clone() );
 		Verify ( pIndex->Prealloc ( false, false, sError ) );
 
@@ -2137,7 +2245,7 @@ void TestRTWeightBoundary ()
 			if ( !pHits )
 				break;
 
-			pIndex->AddDocument ( pHits, pSrc->m_tDocInfo, NULL, dMvas, sError );
+			pIndex->AddDocument ( pHits, pSrc->m_tDocInfo, NULL, dMvas, sError, sWarning );
 			pIndex->Commit ();
 		}
 
@@ -2149,7 +2257,7 @@ void TestRTWeightBoundary ()
 		CSphQueryResult tResult;
 		tQuery.m_sQuery = "@title cat";
 
-		ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, false );
+		ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, NULL, false );
 		assert ( pSorter );
 		Verify ( pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL ) );
 		sphFlattenQueue ( pSorter, &tResult, 0 );
@@ -2250,7 +2358,7 @@ void TestRTSendVsMerge ()
 
 	TestRTInit ();
 
-	CSphString sError;
+	CSphString sError, sWarning;
 	CSphDictSettings tDictSettings;
 
 	ISphTokenizer * pTok = sphCreateUTF8Tokenizer();
@@ -2302,7 +2410,7 @@ void TestRTSendVsMerge ()
 	CSphQueryResult tResult;
 	tQuery.m_sQuery = "@title cat";
 
-	ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, false );
+	ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, NULL, false );
 	assert ( pSorter );
 
 	CSphVector<DWORD> dMvas;
@@ -2316,7 +2424,7 @@ void TestRTSendVsMerge ()
 		if ( !pHits )
 			break;
 
-		pIndex->AddDocument ( pHits, pSrc->m_tDocInfo, NULL, dMvas, sError );
+		pIndex->AddDocument ( pHits, pSrc->m_tDocInfo, NULL, dMvas, sError, sWarning );
 		if ( pSrc->m_tDocInfo.m_iDocID==350 )
 		{
 			pIndex->Commit ();
@@ -2652,7 +2760,17 @@ void TestLog2()
 	printf ( "ok\n" );
 }
 
-void BenchLog2()
+const int TIMER_THREAD_NRUNS = 10*1000*1000;
+
+void BenchTimerThread ( void * pEndtime )
+{
+	volatile int iRes = 0;
+	for ( int i=0; i<TIMER_THREAD_NRUNS; i++ )
+		iRes += (int)sphMicroTimer();
+	*(int64_t*)pEndtime = sphMicroTimer();
+}
+
+void BenchMisc()
 {
 	printf ( "benchmarking rand... " );
 
@@ -2665,17 +2783,56 @@ void BenchLog2()
 	for ( int i=0; i<NRUNS; i++ )
 		iRes += sphRand();
 	t = sphMicroTimer() - t;
-	printf ( "%d msec, res %d\n", (int)( t/1000 ), iRes );
+	printf ( "%d msec per %dM calls, res %d\n", (int)( t/1000 ), (int)( NRUNS/1000000 ), iRes );
 
 	printf ( "benchmarking rand+log2... " );
 	sphSrand ( 0 );
+	iRes = 0;
 	t = sphMicroTimer();
 	for ( int i=0; i<NRUNS; i++ )
 		iRes += sphLog2 ( sphRand() );
 	t = sphMicroTimer() - t;
-	printf ( "%d msec, res %d\n", (int)( t/1000 ), iRes );
+	printf ( "%d msec per %dM calls, res %d\n", (int)( t/1000 ), (int)( NRUNS/1000000 ), iRes );
 
-	exit(0);
+	printf ( "benchmarking timer... " );
+	t = sphMicroTimer();
+	for ( int i=0; i<NRUNS; i++ )
+		iRes += (int)sphMicroTimer();
+	t = sphMicroTimer() - t;
+	printf ( "%d msec per %dM calls, res %d\n", (int)( t/1000 ), (int)( NRUNS/1000000 ), iRes );
+
+	printf ( "benchmarking threaded timer... " );
+
+	const int THREADS = 10;
+	SphThread_t dThd [ THREADS ];
+
+	int64_t tmStart = sphMicroTimer();
+	int64_t tmEnd [ THREADS ];
+	sphThreadInit ( false );
+
+	for ( int i=0; i<THREADS; i++ )
+		sphThreadCreate ( &dThd[i], BenchTimerThread, &tmEnd[i], false );
+	for ( int i=0; i<THREADS; i++ )
+		if ( !sphThreadJoin ( &dThd[i] ) )
+			sphDie ( "thread_join failed" );
+
+	int64_t iMin = INT64_MAX;
+	int64_t iMax = 0;
+	int64_t iAvg = 0;
+	for ( int i=0; i<THREADS; i++ )
+	{
+		int64_t t = tmEnd[i] - tmStart;
+		iMin = Min ( iMin, t );
+		iMax = Max ( iMax, t );
+		iAvg += t;
+	}
+	iMin /= 1000;
+	iMax /= 1000;
+	iAvg /= 1000*THREADS;
+
+	printf ( "avg %d, min %d, max %d msec (%dM calls, %d threads)\n",
+		int(iAvg), int(iMin), int(iMax),
+		(int)( TIMER_THREAD_NRUNS/1000000 ), THREADS );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -2747,13 +2904,13 @@ int main ()
 #endif
 
 #ifdef NDEBUG
+	BenchMisc();
 	BenchStripper ();
 	BenchTokenizer ( false );
 	BenchTokenizer ( true );
 	BenchExpr ();
 	BenchLocators ();
 	BenchThreads ();
-	BenchLog2();
 #else
 	TestQueryParser ();
 	TestQueryTransforms ();

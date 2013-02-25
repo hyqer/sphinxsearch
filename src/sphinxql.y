@@ -70,6 +70,7 @@
 %token	TOK_OPTION
 %token	TOK_ORDER
 %token	TOK_OPTIMIZE
+%token	TOK_PROFILE
 %token	TOK_RAND
 %token	TOK_READ
 %token	TOK_REPEATABLE
@@ -187,14 +188,11 @@ subselect_start:
 
 
 opt_outer_order:
-	// nothing
-		{
-			pParser->m_pQuery->m_sOuterOrderBy = pParser->m_pQuery->m_sOrderBy;
-		}
-	| TOK_ORDER TOK_BY order_items_list
+	TOK_ORDER TOK_BY order_items_list
 		{
 			pParser->m_pQuery->m_sOuterOrderBy.SetBinary ( pParser->m_pBuf+$3.m_iStart,
 				$3.m_iEnd-$3.m_iStart );
+			pParser->m_pQuery->m_bHasOuter = true;
 		}
 	;
 
@@ -203,11 +201,13 @@ opt_outer_limit:
 	| TOK_LIMIT TOK_CONST_INT
 		{
 			pParser->m_pQuery->m_iOuterLimit = $2.m_iValue;
+			pParser->m_pQuery->m_bHasOuter = true;
 		}
 	| TOK_LIMIT TOK_CONST_INT ',' TOK_CONST_INT
 		{
 			pParser->m_pQuery->m_iOuterOffset = $2.m_iValue;
 			pParser->m_pQuery->m_iOuterLimit = $4.m_iValue;
+			pParser->m_pQuery->m_bHasOuter = true;
 		}
 	;
 
@@ -668,6 +668,7 @@ show_what:
 	| TOK_STATUS like_filter			{ pParser->m_pStmt->m_eStmt = STMT_SHOW_STATUS; }
 	| TOK_META like_filter				{ pParser->m_pStmt->m_eStmt = STMT_SHOW_META; }
 	| TOK_AGENT TOK_STATUS like_filter	{ pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS; }
+	| TOK_PROFILE						{ pParser->m_pStmt->m_eStmt = STMT_SHOW_PROFILE; }
 	| TOK_AGENT TOK_QUOTED_STRING TOK_STATUS like_filter
 		{
 			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS;
@@ -917,7 +918,7 @@ call_opt_name:
 describe:
 	describe_tok TOK_IDENT like_filter
 		{
-			pParser->m_pStmt->m_eStmt = STMT_DESC;
+			pParser->m_pStmt->m_eStmt = STMT_DESCRIBE;
 			pParser->m_pStmt->m_sIndex = $2.m_sValue;
 		}
 	;
@@ -1033,7 +1034,7 @@ create_function:
 	TOK_CREATE TOK_FUNCTION TOK_IDENT TOK_RETURNS udf_type TOK_SONAME TOK_QUOTED_STRING
 		{
 			SqlStmt_t & tStmt = *pParser->m_pStmt;
-			tStmt.m_eStmt = STMT_CREATE_FUNC;
+			tStmt.m_eStmt = STMT_CREATE_FUNCTION;
 			tStmt.m_sUdfName = $3.m_sValue;
 			tStmt.m_sUdfLib = $7.m_sValue;
 			tStmt.m_eUdfType = (ESphAttr) $5;
@@ -1050,7 +1051,7 @@ drop_function:
 	TOK_DROP TOK_FUNCTION TOK_IDENT
 		{
 			SqlStmt_t & tStmt = *pParser->m_pStmt;
-			tStmt.m_eStmt = STMT_DROP_FUNC;
+			tStmt.m_eStmt = STMT_DROP_FUNCTION;
 			tStmt.m_sUdfName = $3.m_sValue;
 		}
 	;

@@ -256,7 +256,8 @@ int CSphConfigSection::GetSize ( const char * sKey, int iDefault ) const
 enum
 {
 	KEY_DEPRECATED		= 1UL<<0,
-	KEY_LIST			= 1UL<<1
+	KEY_LIST			= 1UL<<1,
+	KEY_HIDDEN			= 1UL<<2,
 };
 
 /// key descriptor for validation purposes
@@ -280,9 +281,9 @@ static KeyDesc_t g_dKeysSource[] =
 	{ "sql_port",				0, NULL },
 	{ "sql_sock",				0, NULL },
 	{ "mysql_connect_flags",	0, NULL },
-	{ "mysql_ssl_key",			0, NULL },
-	{ "mysql_ssl_cert",			0, NULL },
-	{ "mysql_ssl_ca",			0, NULL },
+	{ "mysql_ssl_key",			0, NULL }, // check.pl mysql_ssl
+	{ "mysql_ssl_cert",			0, NULL }, // check.pl mysql_ssl
+	{ "mysql_ssl_ca",			0, NULL }, // check.pl mysql_ssl
 	{ "mssql_winauth",			0, NULL },
 	{ "mssql_unicode",			0, NULL },
 	{ "sql_query_pre",			KEY_LIST, NULL },
@@ -332,9 +333,9 @@ static KeyDesc_t g_dKeysSource[] =
 	{ "sql_file_field",			KEY_LIST, NULL },
 	{ "sql_column_buffers",		0, NULL },
 	{ "sql_attr_json",			KEY_LIST, NULL },
-	{ "hook_connect",			0, NULL },
-	{ "hook_query_range",		0, NULL },
-	{ "hook_post_index",		0, NULL },
+	{ "hook_connect",			KEY_HIDDEN, NULL },
+	{ "hook_query_range",		KEY_HIDDEN, NULL },
+	{ "hook_post_index",		KEY_HIDDEN, NULL },
 	{ NULL,						0, NULL }
 };
 
@@ -390,7 +391,7 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "blend_chars",			0, NULL },
 	{ "expand_keywords",		0, NULL },
 	{ "hitless_words",			0, NULL },
-	{ "hit_format",				0, NULL },
+	{ "hit_format",				KEY_HIDDEN, NULL },
 	{ "rt_field",				KEY_LIST, NULL },
 	{ "rt_attr_uint",			KEY_LIST, NULL },
 	{ "rt_attr_bigint",			KEY_LIST, NULL },
@@ -399,6 +400,7 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "rt_attr_string",			KEY_LIST, NULL },
 	{ "rt_attr_multi",			KEY_LIST, NULL },
 	{ "rt_attr_multi_64",		KEY_LIST, NULL },
+	{ "rt_attr_json",			KEY_LIST, NULL },
 	{ "rt_mem_limit",			0, NULL },
 	{ "dict",					0, NULL },
 	{ "index_sp",				0, NULL },
@@ -408,8 +410,8 @@ static KeyDesc_t g_dKeysIndex[] =
 	{ "bigram_freq_words",		0, NULL },
 	{ "bigram_index",			0, NULL },
 	{ "index_field_lengths",	0, NULL },
-	{ "divide_remote_ranges",	0, NULL },
-	{ "stopwords_stem",			0, NULL },
+	{ "divide_remote_ranges",	KEY_HIDDEN, NULL },
+	{ "stopwords_unstemmed",	0, NULL },
 	{ "global_idf",				0, NULL },
 	{ NULL,						0, NULL }
 };
@@ -436,7 +438,7 @@ static KeyDesc_t g_dKeysIndexer[] =
 static KeyDesc_t g_dKeysSearchd[] =
 {
 	{ "address",				KEY_DEPRECATED, "listen" },
-	{ "port",					0, NULL },
+	{ "port",					KEY_DEPRECATED, "listen" },
 	{ "listen",					KEY_LIST, NULL },
 	{ "log",					0, NULL },
 	{ "query_log",				0, NULL },
@@ -462,7 +464,7 @@ static KeyDesc_t g_dKeysSearchd[] =
 	{ "subtree_docs_cache",		0, NULL },
 	{ "subtree_hits_cache",		0, NULL },
 	{ "workers",				0, NULL },
-	{ "prefork",				0, NULL },
+	{ "prefork",				KEY_HIDDEN, NULL },
 	{ "dist_threads",			0, NULL },
 	{ "binlog_flush",			0, NULL },
 	{ "binlog_path",			0, NULL },
@@ -1074,7 +1076,7 @@ void sphConfDictionary ( const CSphConfigSection & hIndex, CSphDictSettings & tS
 	tSettings.m_sMorphology = hIndex.GetStr ( "morphology" );
 	tSettings.m_sStopwords = hIndex.GetStr ( "stopwords" );
 	tSettings.m_iMinStemmingLen = hIndex.GetInt ( "min_stemming_len", 1 );
-	tSettings.m_bStopwordsStem = hIndex.GetInt ( "stopwords_stem" )!=0;
+	tSettings.m_bStopwordsUnstemmed = hIndex.GetInt ( "stopwords_unstemmed" )!=0;
 
 	for ( CSphVariant * pWordforms = hIndex("wordforms"); pWordforms; pWordforms = pWordforms->m_pNext )
 	{
@@ -1384,6 +1386,8 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 		pIndex->SetTokenizer ( ISphTokenizer::CreateMultiformFilter ( pIndex->LeakTokenizer(),
 			pIndex->GetDictionary()->GetMultiWordforms () ) );
 	}
+
+	pIndex->SetupQueryTokenizer();
 
 	if ( !pIndex->IsStripperInited () )
 	{
@@ -2102,6 +2106,23 @@ void sphUnlinkIndex ( const char * sName, bool bForce )
 	}
 }
 
+
+void sphCheckDuplicatePaths ( const CSphConfig & hConf )
+{
+	CSphOrderedHash < CSphString, CSphString, CSphStrHashFunc, 256 > hPaths;
+	hConf["index"].IterateStart ();
+	while ( hConf["index"].IterateNext() )
+	{
+		CSphConfigSection & hIndex = hConf["index"].IterateGet ();
+		if ( hIndex ( "path" ) )
+		{
+			const CSphString & sIndex = hConf["index"].IterateGetKey ();
+			if ( hPaths ( hIndex["path"] ) )
+				sphDie ( "duplicate paths: index '%s' has the same path as '%s'.\n", sIndex.cstr(), hPaths[hIndex["path"]].cstr() );
+			hPaths.Add ( sIndex, hIndex["path"] );
+		}
+	}
+}
 
 
 //

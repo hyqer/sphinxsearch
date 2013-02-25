@@ -199,7 +199,7 @@ inline const	DWORD *	STATIC2DOCINFO ( const DWORD * pAttrs )	{ return STATIC2DOC
 #define SPHINX_TAG "-dev"
 #endif
 
-#define SPHINX_VERSION			"2.1.1" SPHINX_BITS_TAG SPHINX_TAG " (" SPH_SVN_TAGREV ")"
+#define SPHINX_VERSION			"2.2.1" SPHINX_BITS_TAG SPHINX_TAG " (" SPH_SVN_TAGREV ")"
 #define SPHINX_BANNER			"Sphinx " SPHINX_VERSION "\nCopyright (c) 2001-2012, Andrew Aksyonoff\nCopyright (c) 2008-2012, Sphinx Technologies Inc (http://sphinxsearch.com)\n\n"
 #define SPHINX_SEARCHD_PROTO	1
 #define SPHINX_CLIENT_VERSION	1
@@ -378,6 +378,10 @@ inline bool operator < ( const CSphRemapRange & a, const CSphRemapRange & b )
 class CSphLowercaser
 {
 	friend class ISphTokenizer;
+	friend class CSphTokenizerBase;
+	friend class CSphTokenizer_UTF8_Base;
+	template<bool> friend class CSphTokenizerBase2;
+
 public:
 				CSphLowercaser ();
 				~CSphLowercaser ();
@@ -473,6 +477,14 @@ enum ESphBigram
 };
 
 
+enum ESphTokenizerClone
+{
+	SPH_CLONE_INDEX,				///< clone tokenizer and set indexing mode
+	SPH_CLONE_QUERY,				///< clone tokenizer and set querying mode
+	SPH_CLONE_QUERY_LIGHTWEIGHT		///< lightweight clone for querying (can parse, can NOT modify settings, shares pointers to the original lowercaser table)
+};
+
+
 struct CSphMultiformContainer;
 class CSphWriter;
 
@@ -554,14 +566,6 @@ public:
 	/// get max codepoint length
 	virtual int						GetMaxCodepointLength () const = 0;
 
-	/// handle tokens less than min_word_len if they match filter
-	virtual void					EnableQueryParserMode ( bool bEnable )
-									{
-										m_bQueryMode = bEnable;
-										m_bShortTokenFilter = bEnable;
-										m_uBlendVariants = BLEND_TRIM_NONE;
-									}
-
 	/// enable indexing-time sentence boundary detection, and paragraph indexing
 	virtual bool					EnableSentenceIndexing ( CSphString & sError );
 
@@ -595,7 +599,7 @@ public:
 
 public:
 	/// spawn a clone of my own
-	virtual ISphTokenizer *			Clone ( bool bEscaped ) const = 0;
+	virtual ISphTokenizer *			Clone ( ESphTokenizerClone eMode ) const = 0;
 
 	/// SBCS or UTF-8?
 	virtual bool					IsUtf8 () const = 0;
@@ -636,7 +640,6 @@ protected:
 	bool							m_bBoundary;				///< boundary flag (true immediately after boundary codepoint)
 	int								m_iBoundaryOffset;			///< boundary character offset (in bytes)
 	bool							m_bWasSpecial;				///< special token flag
-	bool							m_bEscaped;					///< backslash handling flag
 	int								m_iOvershortCount;			///< skipped overshort tokens count
 
 	bool							m_bBlended;					///< whether last token (as in just returned from GetToken()) was blended
@@ -648,7 +651,6 @@ protected:
 	bool							m_bBlendSkipPure;			///< skip purely blended tokens
 
 	bool							m_bShortTokenFilter;		///< short token filter flag
-	bool							m_bQueryMode;				///< is this indexing time or searching time?
 	bool							m_bDetectSentences;			///< should we detect sentence boundaries?
 
 	CSphTokenizerSettings			m_tSettings;				///< tokenizer settings
@@ -682,14 +684,14 @@ struct CSphDictSettings
 	int				m_iMinStemmingLen;
 	bool			m_bWordDict;
 	bool			m_bCrc32;
-	bool			m_bStopwordsStem;
+	bool			m_bStopwordsUnstemmed;
 	CSphString		m_sMorphFingerprint;		///< not used for creation; only for a check when loading
 
 	CSphDictSettings ()
 		: m_iMinStemmingLen ( 1 )
 		, m_bWordDict ( false )
 		, m_bCrc32 ( !USE_64BIT )
-		, m_bStopwordsStem ( false )
+		, m_bStopwordsUnstemmed ( false )
 	{}
 };
 
@@ -2452,6 +2454,7 @@ public:
 	CSphString		m_sOuterOrderBy;	///< temporary (?) subselect hack
 	int				m_iOuterOffset;		///< keep and apply outer offset at master
 	int				m_iOuterLimit;
+	bool			m_bHasOuter;
 
 	bool			m_bReverseScan;		///< perform scan in reverse order
 	bool			m_bIgnoreNonexistent; ///< whether to warning or not about non-existent columns in select list
@@ -2491,6 +2494,7 @@ class CSphQueryResultMeta
 {
 public:
 	int						m_iQueryTime;		///< query time, milliseconds
+	int						m_iRealQueryTime;	///< query time, measured just from start to finish of the query. In milliseconds
 	int64_t					m_iCpuTime;			///< user time, microseconds
 	int						m_iMultiplier;		///< multi-query multiplier, -1 to indicate error
 
@@ -2528,6 +2532,7 @@ public:
 
 
 /// search query result (meta-info plus actual matches)
+class CSphQueryProfile;
 class CSphQueryResult : public CSphQueryResultMeta
 {
 public:
@@ -2543,6 +2548,8 @@ public:
 	int						m_iCount;			///< count which will be actually served (computed from total, offset and limit)
 
 	int						m_iSuccesses;
+
+	CSphQueryProfile *		m_pProfile;			///< filled when query profiling is enabled; NULL otherwise
 
 public:
 							CSphQueryResult ();		///< ctor
@@ -2907,7 +2914,9 @@ public:
 	virtual void				SetWordlistPreload ( bool bValue ) { m_bPreloadWordlist = bValue; }
 	void						SetFieldFilter ( ISphFieldFilter * pFilter );
 	void						SetTokenizer ( ISphTokenizer * pTokenizer );
+	void						SetupQueryTokenizer();
 	const ISphTokenizer *		GetTokenizer () const { return m_pTokenizer; }
+	const ISphTokenizer *		GetQueryTokenizer () const { return m_pQueryTokenizer; }
 	ISphTokenizer *				LeakTokenizer ();
 	void						SetDictionary ( CSphDict * pDict );
 	CSphDict *					GetDictionary () const { return m_pDict; }
@@ -2922,6 +2931,7 @@ public:
 	virtual bool				IsRT() const { return false; }
 	virtual int64_t *			GetFieldLens() const { return NULL; }
 
+	virtual bool				IsStarDict() const { return m_bEnableStar; } // disk index overrides this to support super-old legacy formats
 	virtual void				SetEnableStar ( bool bEnableStar ) { m_bEnableStar = bEnableStar; }
 	bool						IsStarEnabled () const { return m_bEnableStar; }
 
@@ -3044,6 +3054,7 @@ protected:
 
 	ISphFieldFilter *			m_pFieldFilter;
 	ISphTokenizer *				m_pTokenizer;
+	ISphTokenizer *				m_pQueryTokenizer;
 	CSphDict *					m_pDict;
 
 	int							m_iMaxCachedDocs;
@@ -3098,7 +3109,7 @@ ESortClauseParseResult	sphParseSortClause ( const CSphQuery * pQuery, const char
 /// if the pUpdate is given, creates the updater's queue and perform the index update
 /// instead of searching
 ISphMatchSorter *	sphCreateQueue ( const CSphQuery * pQuery, const CSphSchema & tSchema, CSphString & sError,
-	bool bComputeItems=true, CSphSchema * pExtra=NULL, CSphAttrUpdateEx * pUpdate=NULL, bool * pZonespanlist=NULL,
+	CSphQueryProfile * pProfiler, bool bComputeItems=true, CSphSchema * pExtra=NULL, CSphAttrUpdateEx * pUpdate=NULL, bool * pZonespanlist=NULL,
 	bool * pPackedFactors=NULL, ISphExprHook * pHook=NULL );
 
 /// convert queue to sorted array, and add its entries to result's matches array
