@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -573,6 +573,12 @@ struct Filter_And2 : public ISphFilter
 		m_pArg1->SetMVAStorage ( pMva );
 		m_pArg2->SetMVAStorage ( pMva );
 	}
+
+	virtual void SetStringStorage ( const BYTE * pStrings )
+	{
+		m_pArg1->SetStringStorage ( pStrings );
+		m_pArg2->SetStringStorage ( pStrings );
+	}
 };
 
 
@@ -619,6 +625,13 @@ struct Filter_And3 : public ISphFilter
 		m_pArg1->SetMVAStorage ( pMva );
 		m_pArg2->SetMVAStorage ( pMva );
 		m_pArg3->SetMVAStorage ( pMva );
+	}
+
+	virtual void SetStringStorage ( const BYTE * pStrings )
+	{
+		m_pArg1->SetStringStorage ( pStrings );
+		m_pArg2->SetStringStorage ( pStrings );
+		m_pArg3->SetStringStorage ( pStrings );
 	}
 };
 
@@ -798,6 +811,7 @@ static inline ISphFilter * ReportError ( CSphString & sError, const char * sMess
 		case SPH_FILTER_VALUES:			sFilterName = "intvalues"; break;
 		case SPH_FILTER_RANGE:			sFilterName = "intrange"; break;
 		case SPH_FILTER_FLOATRANGE:		sFilterName = "floatrange"; break;
+		case SPH_FILTER_STRING:			sFilterName = "string"; break;
 		default:						sFilterName.SetSprintf ( "(filter-type-%d)", eFilterType ); break;
 	}
 
@@ -851,6 +865,9 @@ static ISphFilter * CreateFilter ( ESphAttr eAttrType, ESphFilter eFilterType, i
 
 		return ReportError ( sError, "unsupported filter type '%s' on float column", eFilterType );
 	}
+
+	if ( eAttrType==SPH_ATTR_STRING || eAttrType==SPH_ATTR_STRINGPTR )
+		return ReportError ( sError, "unsupported filter type '%s' on string column", eFilterType );
 
 	// non-float, non-MVA
 	switch ( eFilterType )
@@ -932,12 +949,18 @@ public:
 				return EvalValues ( (DWORD)sphJsonLoadInt ( &pValue ) );
 			case JSON_INT64:
 				return EvalValues ( sphJsonLoadBigint ( &pValue ) );
+			case JSON_DOUBLE:
+				return EvalValues ( (SphAttr_t)sphQW2D ( sphJsonLoadBigint ( &pValue ) ) );
 			default:
 				return false;
 		}
 	}
 };
 
+
+#if USE_WINDOWS
+#pragma warning(disable:4127) // conditional expr is const for MSVC
+#endif
 
 template < bool HAS_EQUALS >
 class JsonFilterRange_c : public JsonFilter_c<IFilter_Range>
@@ -957,9 +980,61 @@ public:
 				return EvalRange<HAS_EQUALS> ( sphJsonLoadInt ( &pValue ), m_iMinValue, m_iMaxValue );
 			case JSON_INT64:
 				return EvalRange<HAS_EQUALS> ( sphJsonLoadBigint ( &pValue ), m_iMinValue, m_iMaxValue );
+			case JSON_DOUBLE:
+			{
+				double fValue = sphQW2D ( sphJsonLoadBigint ( &pValue ) );
+				if ( HAS_EQUALS )
+					return fValue>=m_iMinValue && fValue<=m_iMaxValue;
+				else
+					return fValue>m_iMinValue && fValue<m_iMaxValue;
+			}
 			default:
 				return false;
 		}
+	}
+};
+
+
+template < bool HAS_EQUALS >
+class JsonFilterFloatRange_c : public JsonFilter_c<IFilter_Range>
+{
+public:
+	JsonFilterFloatRange_c ( const CSphAttrLocator & tLoc, const char * pInCol )
+		: JsonFilter_c<IFilter_Range> ( tLoc, pInCol )
+	{}
+
+	float m_fMinValue;
+	float m_fMaxValue;
+
+	virtual void SetRangeFloat ( float fMin, float fMax )
+	{
+		m_fMinValue = fMin;
+		m_fMaxValue = fMax;
+	}
+
+	virtual bool Eval ( const CSphMatch & tMatch ) const
+	{
+		const BYTE * pValue;
+		float fValue;
+		ESphJsonType eRes = GetKey ( &pValue, tMatch );
+		switch ( eRes )
+		{
+			case JSON_INT32:
+				fValue = (float)sphJsonLoadInt ( &pValue );
+				break;
+			case JSON_INT64:
+				fValue = (float)sphJsonLoadBigint ( &pValue );
+				break;
+			case JSON_DOUBLE:
+				fValue = (float)sphQW2D ( sphJsonLoadBigint ( &pValue ) );
+				break;
+			default:
+				return false;
+		}
+		if ( HAS_EQUALS )
+			return fValue>=m_fMinValue && fValue<=m_fMaxValue;
+		else
+			return fValue>m_fMinValue && fValue<m_fMaxValue;
 	}
 };
 
@@ -1009,6 +1084,11 @@ static ISphFilter * CreateFilterJson ( const CSphColumnInfo * pAttr, ESphFilter 
 	{
 		case SPH_FILTER_VALUES:
 			return new JsonFilterValues_c ( pAttr->m_tLocator, pInCol );
+		case SPH_FILTER_FLOATRANGE:
+			if ( bRangeEq )
+				return new JsonFilterFloatRange_c<true> ( pAttr->m_tLocator, pInCol );
+			else
+				return new JsonFilterFloatRange_c<false> ( pAttr->m_tLocator, pInCol );
 		case SPH_FILTER_RANGE:
 			if ( bRangeEq )
 				return new JsonFilterRange_c<true> ( pAttr->m_tLocator, pInCol );

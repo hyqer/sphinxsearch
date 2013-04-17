@@ -19,18 +19,23 @@
 %token	TOK_USERVAR
 %token	TOK_SYSVAR
 %token	TOK_CONST_STRINGS
+%token	TOK_BAD_NUMERIC
 
+%token	TOK_ADD
 %token	TOK_AGENT
+%token	TOK_ALTER
 %token	TOK_AS
 %token	TOK_ASC
 %token	TOK_ATTACH
 %token	TOK_AVG
 %token	TOK_BEGIN
 %token	TOK_BETWEEN
+%token	TOK_BIGINT
 %token	TOK_BY
 %token	TOK_CALL
 %token	TOK_CHARACTER
 %token	TOK_COLLATION
+%token	TOK_COLUMN
 %token	TOK_COMMIT
 %token	TOK_COMMITTED
 %token	TOK_COUNT
@@ -55,6 +60,7 @@
 %token	TOK_INDEX
 %token	TOK_INSERT
 %token	TOK_INT
+%token	TOK_INTEGER
 %token	TOK_INTO
 %token	TOK_ISOLATION
 %token	TOK_LEVEL
@@ -70,6 +76,7 @@
 %token	TOK_OPTION
 %token	TOK_ORDER
 %token	TOK_OPTIMIZE
+%token	TOK_PLAN
 %token	TOK_PROFILE
 %token	TOK_RAND
 %token	TOK_READ
@@ -88,6 +95,7 @@
 %token	TOK_STATUS
 %token	TOK_STRING
 %token	TOK_SUM
+%token	TOK_TABLE
 %token	TOK_TABLES
 %token	TOK_TO
 %token	TOK_TRANSACTION
@@ -151,6 +159,7 @@ statement:
 	| select_sysvar
 	| truncate
 	| optimize_index
+	| alter
 	;
 
 //////////////////////////////////////////////////////////////////////////
@@ -166,12 +175,43 @@ multi_stmt:
 	;
 
 select:
+	select1
+	| TOK_SELECT TOK_IDENT '(' '(' select1 ')' opt_tablefunc_args ')'
+		{
+			assert ( pParser->m_pStmt->m_eStmt==STMT_SELECT ); // set by table argument
+			pParser->m_pStmt->m_sTableFunc = $2.m_sValue;
+		}
+	;
+
+select1:
 	select_from
 	| TOK_SELECT select_items_list TOK_FROM '(' subselect_start select_from ')'
 		opt_outer_order opt_outer_limit
 		{
 			assert ( pParser->m_pStmt->m_eStmt==STMT_SELECT ); // set by subselect
 		}
+	;
+
+opt_tablefunc_args:
+	// nothing
+	| ',' tablefunc_args_list
+	;
+
+tablefunc_args_list:
+	tablefunc_arg
+		{
+			pParser->m_pStmt->m_dTableFuncArgs.Add ( $1.m_sValue );
+		}
+	| tablefunc_args_list ',' tablefunc_arg
+		{
+			pParser->m_pStmt->m_dTableFuncArgs.Add ( $3.m_sValue );
+		}
+	;
+
+tablefunc_arg:
+	TOK_IDENT
+	| TOK_CONST_INT		{ $$.m_sValue.SetSprintf ( "%d", $1.m_iValue ); }
+	| TOK_ID			{ $$.m_sValue = "id"; }
 	;
 
 subselect_start:
@@ -251,7 +291,6 @@ select_expr:
 	| TOK_SUM '(' expr ')'				{ pParser->AddItem ( &$3, SPH_AGGR_SUM, &$1, &$4 ); }
 	| TOK_GROUP_CONCAT '(' expr ')'		{ pParser->AddItem ( &$3, SPH_AGGR_CAT, &$1, &$4 ); }
 	| TOK_COUNT '(' '*' ')'				{ if ( !pParser->AddItem ( "count(*)", &$1, &$4 ) ) YYERROR; }
-	| TOK_WEIGHT '(' ')'				{ if ( !pParser->AddItem ( "weight()", &$1, &$3 ) ) YYERROR; }
 	| TOK_GROUPBY '(' ')'				{ if ( !pParser->AddItem ( "groupby()", &$1, &$3 ) ) YYERROR; }
 	| TOK_COUNT '(' TOK_DISTINCT TOK_IDENT ')' 	{ if ( !pParser->AddDistinct ( &$4, &$1, &$5 ) ) YYERROR; }
 	;
@@ -303,7 +342,7 @@ where_item:
 			if ( !pFilter )
 				YYERROR;
 			pFilter->m_dValues = *$4.m_pValues.Ptr();
-			pFilter->m_dValues.Sort();
+			pFilter->m_dValues.Uniq();
 		}
 	| expr_ident TOK_NOT TOK_IN '(' const_list ')'
 		{
@@ -312,7 +351,7 @@ where_item:
 				YYERROR;
 			pFilter->m_dValues = *$5.m_pValues.Ptr();
 			pFilter->m_bExclude = true;
-			pFilter->m_dValues.Sort();
+			pFilter->m_dValues.Uniq();
 		}
 	| expr_ident TOK_IN TOK_USERVAR
 		{
@@ -349,14 +388,29 @@ where_item:
 			if ( !pParser->AddIntFilterLesser ( $1.m_sValue, $3.m_iValue, true ) )
 				YYERROR;
 		}
+	| expr_ident '=' const_float
+		{
+			if ( !pParser->AddFloatRangeFilter ( $1.m_sValue, $3.m_fValue, $3.m_fValue, true ) )
+				YYERROR;
+		}
 	| expr_float_unhandled
 		{
-			yyerror ( pParser, "EQ and NEQ filters on floats are not (yet?) supported" );
+			yyerror ( pParser, "NEQ filter on floats is not (yet?) supported" );
 			YYERROR;
 		}
 	| expr_ident TOK_BETWEEN const_float TOK_AND const_float
 		{
 			if ( !pParser->AddFloatRangeFilter ( $1.m_sValue, $3.m_fValue, $5.m_fValue, true ) )
+				YYERROR;
+		}
+	| expr_ident TOK_BETWEEN const_int TOK_AND const_float
+		{
+			if ( !pParser->AddFloatRangeFilter ( $1.m_sValue, $3.m_iValue, $5.m_fValue, true ) )
+				YYERROR;
+		}
+	| expr_ident TOK_BETWEEN const_float TOK_AND const_int
+		{
+			if ( !pParser->AddFloatRangeFilter ( $1.m_sValue, $3.m_fValue, $5.m_iValue, true ) )
 				YYERROR;
 		}
 	| expr_ident '>' const_float
@@ -392,8 +446,7 @@ where_item:
 	;
 
 expr_float_unhandled:
-	expr_ident '=' const_float
-	| expr_ident TOK_NE const_float
+	expr_ident TOK_NE const_float
 	;
 
 expr_ident:
@@ -461,13 +514,25 @@ const_list:
 
 opt_group_clause:
 	// empty
-	| group_clause
+	| TOK_GROUP opt_int TOK_BY group_items_list
 	;
 
-group_clause:
-	TOK_GROUP TOK_BY expr_ident
+opt_int:
+	// empty
+	| TOK_CONST_INT
 		{
-			pParser->SetGroupBy ( $3.m_sValue );
+			pParser->SetGroupbyLimit ( $1.m_iValue );
+		}
+	;
+
+group_items_list:
+	expr_ident
+		{
+			pParser->AddGroupBy ( $1.m_sValue );
+		}
+	| group_items_list ',' expr_ident
+		{
+			pParser->AddGroupBy ( $3.m_sValue );
 		}
 	;
 
@@ -632,9 +697,13 @@ expr:
 function:
 	TOK_IDENT '(' arglist ')'	{ $$ = $1; $$.m_iEnd = $4.m_iEnd; }
 	| TOK_IN '(' arglist ')'	{ $$ = $1; $$.m_iEnd = $4.m_iEnd; }			// handle exception from 'ident' rule
+	| TOK_INTEGER '(' arglist ')'	{ $$ = $1; $$.m_iEnd = $4.m_iEnd; }
+	| TOK_BIGINT '(' arglist ')'	{ $$ = $1; $$.m_iEnd = $4.m_iEnd; }
+	| TOK_FLOAT '(' arglist ')'	{ $$ = $1; $$.m_iEnd = $4.m_iEnd; }
 	| TOK_IDENT '(' ')'			{ $$ = $1; $$.m_iEnd = $3.m_iEnd }
 	| TOK_MIN '(' expr ',' expr ')'		{ $$ = $1; $$.m_iEnd = $6.m_iEnd }	// handle clash with aggregate functions
 	| TOK_MAX '(' expr ',' expr ')'		{ $$ = $1; $$.m_iEnd = $6.m_iEnd }
+	| TOK_WEIGHT '(' ')'				{ $$ = $1; $$.m_iEnd = $3.m_iEnd }
 	;
 
 arglist:
@@ -669,6 +738,7 @@ show_what:
 	| TOK_META like_filter				{ pParser->m_pStmt->m_eStmt = STMT_SHOW_META; }
 	| TOK_AGENT TOK_STATUS like_filter	{ pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS; }
 	| TOK_PROFILE						{ pParser->m_pStmt->m_eStmt = STMT_SHOW_PROFILE; }
+	| TOK_PLAN							{ pParser->m_pStmt->m_eStmt = STMT_SHOW_PLAN; }
 	| TOK_AGENT TOK_QUOTED_STRING TOK_STATUS like_filter
 		{
 			pParser->m_pStmt->m_eStmt = STMT_SHOW_AGENT_STATUS;
@@ -966,6 +1036,25 @@ update_item:
 		{
 			SqlNode_t tNoValues;
 			pParser->UpdateMVAAttr ( $1.m_sValue, tNoValues );
+		}
+	;
+
+//////////////////////////////////////////////////////////////////////////
+
+alter_col_type:
+	TOK_INTEGER 	{ $$.m_iValue = SPH_ATTR_INTEGER; }
+	| TOK_BIGINT	{ $$.m_iValue = SPH_ATTR_BIGINT; }
+	| TOK_FLOAT		{ $$.m_iValue = SPH_ATTR_FLOAT; }
+	;
+
+alter:
+	TOK_ALTER TOK_TABLE TOK_IDENT TOK_ADD TOK_COLUMN TOK_IDENT alter_col_type
+		{
+			SqlStmt_t & tStmt = *pParser->m_pStmt;
+			tStmt.m_eStmt = STMT_ALTER;
+			tStmt.m_sIndex = $3.m_sValue;
+			tStmt.m_sAlterAttr = $6.m_sValue;
+			tStmt.m_eAlterColType = (ESphAttr)$7.m_iValue;
 		}
 	;
 

@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -613,13 +613,13 @@ bool CSphConfigParser::ValidateKey ( const char * sKey )
 
 #if !USE_WINDOWS
 
-bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szFilename, CSphVector<char> & dResult )
+bool TryToExec ( char * pBuffer, char * pEnd, const char * szFilename, CSphVector<char> & dResult, char * sError, int iErrorLen )
 {
 	int dPipe[2] = { -1, -1 };
 
 	if ( pipe ( dPipe ) )
 	{
-		snprintf ( m_sError, sizeof ( m_sError ), "pipe() failed (error=%s)", strerror(errno) );
+		snprintf ( sError, iErrorLen, "pipe() failed (error=%s)", strerror(errno) );
 		return false;
 	}
 
@@ -660,7 +660,7 @@ bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szF
 	} else
 		if ( iChild==-1 )
 		{
-			snprintf ( m_sError, sizeof ( m_sError ), "fork failed: [%d] %s", errno, strerror(errno) );
+			snprintf ( sError, iErrorLen, "fork failed: [%d] %s", errno, strerror(errno) );
 			return false;
 		}
 
@@ -701,7 +701,7 @@ bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szF
 
 		if ( iResult==-1 && errno!=EINTR )
 		{
-			snprintf ( m_sError, sizeof ( m_sError ), "waitpid() failed: [%d] %s", errno, strerror(errno) );
+			snprintf ( sError, iErrorLen, "waitpid() failed: [%d] %s", errno, strerror(errno) );
 			return false;
 		}
 	}
@@ -710,19 +710,19 @@ bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szF
 	if ( WIFEXITED ( iStatus ) && WEXITSTATUS ( iStatus ) )
 	{
 		// FIXME? read stderr and log that too
-		snprintf ( m_sError, sizeof ( m_sError ), "error executing '%s' status = %d", pBuffer, WEXITSTATUS ( iStatus ) );
+		snprintf ( sError, iErrorLen, "error executing '%s' status = %d", pBuffer, WEXITSTATUS ( iStatus ) );
 		return false;
 	}
 
 	if ( WIFSIGNALED ( iStatus ) )
 	{
-		snprintf ( m_sError, sizeof ( m_sError ), "error executing '%s', killed by signal %d", pBuffer, WTERMSIG ( iStatus ) );
+		snprintf ( sError, iErrorLen, "error executing '%s', killed by signal %d", pBuffer, WTERMSIG ( iStatus ) );
 		return false;
 	}
 
 	if ( iBytesRead < 0 )
 	{
-		snprintf ( m_sError, sizeof ( m_sError ), "pipe read error: [%d] %s", errno, strerror(errno) );
+		snprintf ( sError, iErrorLen, "pipe read error: [%d] %s", errno, strerror(errno) );
 		return false;
 	}
 
@@ -730,6 +730,11 @@ bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szF
 	dResult [iTotalRead] = '\0';
 
 	return true;
+}
+
+bool CSphConfigParser::TryToExec ( char * pBuffer, char * pEnd, const char * szFilename, CSphVector<char> & dResult )
+{
+	return ::TryToExec ( pBuffer, pEnd, szFilename, dResult, m_sError, sizeof(m_sError) );
 }
 #endif
 
@@ -1417,7 +1422,8 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 		fprintf ( stdout, "WARNING: no morphology, index_exact_words=1 has no effect, ignoring\n" );
 	}
 
-	if ( pDict->GetSettings().m_bWordDict && pDict->HasMorphology() && tSettings.m_iMinPrefixLen && !tSettings.m_bIndexExactWords )
+	if ( pDict->GetSettings().m_bWordDict && pDict->HasMorphology() &&
+		( tSettings.m_iMinPrefixLen || tSettings.m_iMinInfixLen ) && !tSettings.m_bIndexExactWords )
 	{
 		tSettings.m_bIndexExactWords = true;
 		pIndex->Setup ( tSettings );
@@ -2092,14 +2098,12 @@ void sphUnlinkIndex ( const char * sName, bool bForce )
 	if ( !( g_bUnlinkOld || bForce ) )
 		return;
 
-	// FIXME! ext list must be in sync with sphinx.cpp, searchd.cpp
-	const int EXT_COUNT = 10;
-	const char * dCurExts[EXT_COUNT] = { ".sph", ".spa", ".spi", ".spd", ".spp", ".spm", ".spk", ".sps", ".spe", ".mvp" };
 	char sFileName[SPH_MAX_FILENAME_LEN];
 
-	for ( int j=0; j<EXT_COUNT; j++ )
+	// +1 is for .mvp
+	for ( int i=0; i<sphGetExtCount()+1; i++ )
 	{
-		snprintf ( sFileName, sizeof(sFileName), "%s%s", sName, dCurExts[j] );
+		snprintf ( sFileName, sizeof(sFileName), "%s%s", sName, sphGetExts ( SPH_EXT_TYPE_CUR )[i] );
 		// 'mvp' is optional file
 		if ( ::unlink ( sFileName ) && errno!=ENOENT )
 			sphWarning ( "unlink failed (file '%s', error '%s'", sFileName, strerror(errno) );

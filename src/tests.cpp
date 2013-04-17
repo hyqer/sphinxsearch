@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -334,6 +334,18 @@ void TestTokenizer ( bool bUTF8 )
 		assert ( *pTokenizer->GetTokenStart()=='d' );
 		assert ( *pTokenizer->GetTokenEnd()=='\0' );
 
+		// test embedded zeroes
+		printf ( "%s vs embedded zeroes\n", sPrefix );
+
+		char sLine7[] = "abc\0\0\0defgh";
+		pTokenizer->SetBuffer ( (BYTE*)sLine7, 9 );
+
+		assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "abc" ) );
+		assert ( !strcmp ( (const char*)pTokenizer->GetToken(), "def" ) );
+		assert ( !pTokenizer->GetToken() );
+		assert ( !pTokenizer->GetToken() );
+		assert ( !pTokenizer->GetToken() );
+
 		// done
 		SafeDelete ( pTokenizer );
 	}
@@ -460,7 +472,7 @@ void TestTokenizer ( bool bUTF8 )
 	BYTE sRes21[SPH_MAX_WORD_LEN];
 
 	memset ( sRes21, 0, sizeof(sRes21) );
-	BYTE * pTest21 = sTest21;
+	const BYTE * pTest21 = sTest21;
 	int iCode21 = sphUTF8Decode ( pTest21 );
 	assert ( sphUTF8Encode ( sRes21, iCode21 )==4 );
 	assert ( sTest21[0]==sRes21[0] && sTest21[1]==sRes21[1] && sTest21[2]==sRes21[2] && sTest21[3]==sRes21[3] );
@@ -965,14 +977,16 @@ public:
 	virtual bool				EarlyReject ( CSphQueryContext * , CSphMatch & ) const { return false; }
 	virtual const CSphSourceStats &	GetStats () const { return g_tTmpDummyStat; }
 	virtual CSphIndexStatus			GetStatus () const { CSphIndexStatus tRes; tRes.m_iRamUse = 0; return tRes; }
-	virtual bool				MultiQuery ( const CSphQuery * , CSphQueryResult * , int , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, bool ) const { return false; }
-	virtual bool				MultiQueryEx ( int , const CSphQuery * , CSphQueryResult ** , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, bool ) const { return false; }
+	virtual bool				MultiQuery ( const CSphQuery * , CSphQueryResult * , int , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, int, bool ) const { return false; }
+	virtual bool				MultiQueryEx ( int , const CSphQuery * , CSphQueryResult ** , ISphMatchSorter ** , const CSphVector<CSphFilterSettings> * , int, int, bool ) const { return false; }
 	virtual bool				GetKeywords ( CSphVector <CSphKeywordInfo> & , const char * , bool , CSphString & ) const { return false; }
 	virtual bool				FillKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, CSphString & sError ) const;
 	virtual int					UpdateAttributes ( const CSphAttrUpdate & , int , CSphString & ) { return -1; }
 	virtual bool				SaveAttributes ( CSphString & ) const { return false; }
 	virtual DWORD				GetAttributeStatus () const { return 0; }
-	virtual void				DebugDumpHeader ( FILE * , const char * , bool ) {}
+	virtual bool				CreateFilesWithAttr ( const CSphString &, ESphAttr, CSphString & ) { return true; }
+	virtual bool				AddAttribute ( const CSphString &, ESphAttr, CSphString & ) { return true; }
+	virtual void				DebugDumpHeader ( FILE *, const char *, bool ) {}
 	virtual void				DebugDumpDocids ( FILE * ) {}
 	virtual void				DebugDumpHitlist ( FILE * , const char * , bool ) {}
 	virtual int					DebugCheck ( FILE * ) { return 0; } // NOLINT
@@ -2074,6 +2088,22 @@ void TestStridedSort ()
 		const int iNrmCount = Max ( iRndCount, 1 );
 		TestStridedSortPass ( iNrmStride, iNrmCount );
 	}
+
+	// regression of uniq vs empty array
+	DWORD dUniq[] = { 1, 1, 3, 1 };
+	int iCount = sizeof(dUniq)/sizeof(dUniq[0]);
+	assert ( sphUniq ( dUniq, 0 )==0 );
+	sphSort ( dUniq, iCount );
+	assert ( sphUniq ( dUniq, iCount )==2 && dUniq[0]==1 && dUniq[1]==3 );
+	CSphVector<DWORD> dUniq1;
+	dUniq1.Uniq();
+	assert ( dUniq1.GetLength()==0 );
+	dUniq1.Add ( 1 );
+	dUniq1.Add ( 3 );
+	dUniq1.Add ( 1 );
+	dUniq1.Add ( 1 );
+	dUniq1.Uniq();
+	assert ( dUniq1.GetLength()==2 && dUniq1[0]==1 && dUniq1[1]==3 );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -2163,7 +2193,7 @@ void TestRTInit ()
 {
 	CSphConfigSection tRTConfig;
 
-	sphRTInit();
+	sphRTInit ( tRTConfig, true );
 	sphRTConfigure ( tRTConfig, true );
 
 	SmallStringHash_T<CSphIndex*> hIndexes;
@@ -2259,7 +2289,7 @@ void TestRTWeightBoundary ()
 
 		ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, NULL, false );
 		assert ( pSorter );
-		Verify ( pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL ) );
+		Verify ( pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL, 1 ) );
 		sphFlattenQueue ( pSorter, &tResult, 0 );
 		CheckRT ( tResult.m_dMatches.GetLength(), 1, "results found" );
 		CheckRT ( (int)tResult.m_dMatches[0].m_iDocID, 1, "docID" );
@@ -2428,7 +2458,7 @@ void TestRTSendVsMerge ()
 		if ( pSrc->m_tDocInfo.m_iDocID==350 )
 		{
 			pIndex->Commit ();
-			Verify ( pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL ) );
+			Verify ( pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL, 1 ) );
 			sphFlattenQueue ( pSorter, &tResult, 0 );
 		}
 	}
@@ -2890,6 +2920,35 @@ void TestArabicStemmer()
 
 //////////////////////////////////////////////////////////////////////////
 
+void TestAppendf()
+{
+	CSphStringBuilder sRes;
+	sRes.Appendf ( "12345678" );
+	sRes.Appendf ( "this is my rifle this is my gun" );
+	sRes.Appendf ( " int=%d float=%f string=%s", 123, 456.789, "helloworld" );
+	assert ( strcmp ( sRes.cstr(), "12345678this is my rifle this is my gun int=123 float=456.789000 string=helloworld" )==0 );
+}
+
+void BenchAppendf()
+{
+	int64_t tm1 = sphMicroTimer();
+	CSphStringBuilder sRes1;
+	for ( int i=0; i<200; i++ )
+		sRes1.Appendf ( "%d ", i );
+	tm1 = sphMicroTimer() - tm1;
+
+	int64_t tm2 = sphMicroTimer();
+	CSphString sRes2;
+	sRes2.SetSprintf ( "%d ", 0 );
+	for ( int i=1; i<200; i++ )
+		sRes2.SetSprintf ( "%s%d ", sRes2.cstr(), i );
+	tm2 = sphMicroTimer() - tm2;
+
+	printf ( "benchmarking stringbuilder... %d microsec builder vs %d microsec string\n", int(tm1), int(tm2) );
+}
+
+//////////////////////////////////////////////////////////////////////////
+
 int main ()
 {
 	// threads should be initialized before memory allocations
@@ -2904,6 +2963,7 @@ int main ()
 #endif
 
 #ifdef NDEBUG
+	BenchAppendf();
 	BenchMisc();
 	BenchStripper ();
 	BenchTokenizer ( false );
@@ -2912,6 +2972,7 @@ int main ()
 	BenchLocators ();
 	BenchThreads ();
 #else
+	TestAppendf();
 	TestQueryParser ();
 	TestQueryTransforms ();
 	TestStripper ();
@@ -2940,3 +3001,4 @@ int main ()
 //
 // $Id$
 //
+

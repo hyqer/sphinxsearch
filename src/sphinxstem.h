@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -70,7 +70,7 @@ const CSphNamedInt &	sphAotDictinfoRu();
 /// create token filter that returns all morphological hypotheses
 /// NOTE, takes over wordforms from pDict, in AOT case they must be handled by the fitler
 class CSphTokenFilter;
-CSphTokenFilter *		sphAotCreateFilter ( ISphTokenizer * pTokenizer, CSphDict * pDict );
+CSphTokenFilter *		sphAotCreateFilter ( ISphTokenizer * pTokenizer, CSphDict * pDict, bool bIndexExact );
 
 #endif // _sphinxstem_
 

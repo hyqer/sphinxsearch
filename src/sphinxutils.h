@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -131,6 +131,10 @@ protected:
 #endif
 	char *			GetBufferString ( char * szDest, int iMax, const char * & szSource );
 };
+
+#if !USE_WINDOWS
+bool TryToExec ( char * pBuffer, char * pEnd, const char * szFilename, CSphVector<char> & dResult, char * sError, int iErrorLen );
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 

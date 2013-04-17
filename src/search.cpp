@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -325,7 +325,7 @@ int main ( int argc, char ** argv )
 			}
 
 			pResult = new CSphQueryResult();
-			if ( !pIndex->MultiQuery ( &tQuery, pResult, 1, &pTop, NULL ) )
+			if ( !pIndex->MultiQuery ( &tQuery, pResult, 1, &pTop, NULL, 1 ) )
 			{
 				// failure; pull that error message
 				sError = pResult->m_sError;

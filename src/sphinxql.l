@@ -34,6 +34,8 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 <ccomment>"*/"		{ BEGIN(INITIAL); }
 
 "AGENT"				{ YYSTOREBOUNDS; return TOK_AGENT; }
+"ALTER"				{ YYSTOREBOUNDS; return TOK_ALTER; }
+"ADD"				{ YYSTOREBOUNDS; return TOK_ADD; }
 "AND"				{ YYSTOREBOUNDS; return TOK_AND; }
 "AS"				{ YYSTOREBOUNDS; return TOK_AS; }
 "ASC"				{ YYSTOREBOUNDS; return TOK_ASC; }
@@ -41,10 +43,12 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 "AVG"				{ YYSTOREBOUNDS; return TOK_AVG; }
 "BEGIN"				{ YYSTOREBOUNDS; return TOK_BEGIN; }
 "BETWEEN"			{ YYSTOREBOUNDS; return TOK_BETWEEN; }
+"BIGINT"			{ YYSTOREBOUNDS; return TOK_BIGINT; }
 "BY"				{ YYSTOREBOUNDS; return TOK_BY; }
 "CALL"				{ YYSTOREBOUNDS; return TOK_CALL; }
 "CHARACTER"			{ YYSTOREBOUNDS; return TOK_CHARACTER; }
 "COLLATION"			{ YYSTOREBOUNDS; return TOK_COLLATION; }
+"COLUMN"			{ YYSTOREBOUNDS; return TOK_COLUMN; }
 "COMMIT"			{ YYSTOREBOUNDS; return TOK_COMMIT; }
 "COMMITTED"			{ YYSTOREBOUNDS; return TOK_COMMITTED; }
 "COUNT"				{ YYSTOREBOUNDS; return TOK_COUNT; }
@@ -68,6 +72,7 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 "IN"				{ YYSTOREBOUNDS; return TOK_IN; }
 "INDEX"				{ YYSTOREBOUNDS; return TOK_INDEX; }
 "INSERT"			{ YYSTOREBOUNDS; return TOK_INSERT; }
+"INTEGER"			{ YYSTOREBOUNDS; return TOK_INTEGER; }
 "INT"				{ YYSTOREBOUNDS; return TOK_INT; }
 "INTO"				{ YYSTOREBOUNDS; return TOK_INTO; }
 "ISOLATION"			{ YYSTOREBOUNDS; return TOK_ISOLATION; }
@@ -86,6 +91,7 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 "OPTIMIZE"			{ YYSTOREBOUNDS; return TOK_OPTIMIZE; }
 "OR"				{ YYSTOREBOUNDS; return TOK_OR; }
 "ORDER"				{ YYSTOREBOUNDS; return TOK_ORDER; }
+"PLAN"				{ YYSTOREBOUNDS; return TOK_PLAN; }
 "PROFILE"			{ YYSTOREBOUNDS; return TOK_PROFILE; }
 "RAND"				{ YYSTOREBOUNDS; return TOK_RAND; }
 "READ"				{ YYSTOREBOUNDS; return TOK_READ; }
@@ -104,6 +110,7 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 "STATUS"			{ YYSTOREBOUNDS; return TOK_STATUS; }
 "STRING"			{ YYSTOREBOUNDS; return TOK_STRING; }
 "SUM"				{ YYSTOREBOUNDS; return TOK_SUM; }
+"TABLE"				{ YYSTOREBOUNDS; return TOK_TABLE; }
 "TABLES"			{ YYSTOREBOUNDS; return TOK_TABLES; }
 "TO"				{ YYSTOREBOUNDS; return TOK_TO; }
 "TRANSACTION"		{ YYSTOREBOUNDS; return TOK_TRANSACTION; }
@@ -135,9 +142,10 @@ EXPONENT			[eE](\+|-)?{DIGIT}+
 "@weight"			{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_ATIDENT; }
 "@count"			{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_ATIDENT; }
 {ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_IDENT; }
+[a-zA-Z_0-9]+		{ YYSTOREBOUNDS; return TOK_BAD_NUMERIC; }
 @{ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_USERVAR; }
 @@{ID}				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_SYSVAR; }
-"`ID`"				{ YYSTOREBOUNDS; lvalp->m_sValue = yytext; return TOK_ID; }
+"`ID`"				{ YYSTOREBOUNDS; lvalp->m_iStart++; lvalp->m_iEnd--; lvalp->m_sValue.SetBinary ( yytext+1, strlen(yytext)-2 ); return TOK_ID; }
 `{ID}`				{ YYSTOREBOUNDS; lvalp->m_iStart++; lvalp->m_iEnd--; lvalp->m_sValue.SetBinary ( yytext+1, strlen(yytext)-2 ); return TOK_IDENT; }
 
 {SPACE}+			{ ; }

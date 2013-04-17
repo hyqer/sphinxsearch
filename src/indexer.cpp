@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -206,6 +206,7 @@ public:
 	virtual const CSphVector <CSphSavedFile> & GetStopwordsFileInfos () { return m_dSWFileInfos; }
 	virtual const CSphVector <CSphSavedFile> & GetWordformsFileInfos () { return m_dWFFileInfos; }
 	virtual const CSphMultiformContainer * GetMultiWordforms () const { return NULL; }
+	virtual uint64_t		GetSettingsFNV () const { return 0; }
 
 	virtual bool IsStopWord ( const BYTE * ) const { return false; }
 
@@ -601,7 +602,7 @@ bool SqlParamsConfigure ( CSphSourceParams_SQL & tParams, const CSphConfigSectio
 	SqlAttrsConfigure ( tParams,	hSource("sql_attr_str2wordcount"),	SPH_ATTR_WORDCOUNT,	sSourceName );
 
 	SqlAttrsConfigure ( tParams,	hSource("sql_field_string"),		SPH_ATTR_STRING,	sSourceName, true );
-	SqlAttrsConfigure ( tParams,	hSource("sql_field_str2wordcount"),	SPH_ATTR_STRING,	sSourceName, true );
+	SqlAttrsConfigure ( tParams,	hSource("sql_field_str2wordcount"),	SPH_ATTR_WORDCOUNT,	sSourceName, true );
 
 	LOC_GETA ( tParams.m_dFileFields,			"sql_file_field" );
 
@@ -734,6 +735,7 @@ CSphSource * SpawnSourceMSSQL ( const CSphConfigSection & hSource, const char * 
 	LOC_GETB ( tParams.m_bWinAuth, "mssql_winauth" );
 	LOC_GETB ( tParams.m_bUnicode, "mssql_unicode" );
 	LOC_GETS ( tParams.m_sColBuffers, "sql_column_buffers" );
+	LOC_GETS ( tParams.m_sOdbcDSN, "odbc_dsn" ); // a shortcut, may be used instead of other specific combination
 
 	CSphSource_MSSQL * pSrc = new CSphSource_MSSQL ( sSourceName );
 	if ( !pSrc->Setup ( tParams ) )
@@ -958,7 +960,7 @@ bool DoIndex ( const CSphConfigSection & hIndex, const char * sIndexName,
 
 		// aot filter
 		if ( tSettings.m_bAotFilter )
-			pTokenizer = sphAotCreateFilter ( pTokenizer, pDict );
+			pTokenizer = sphAotCreateFilter ( pTokenizer, pDict, tSettings.m_bIndexExactWords );
 	}
 
 	ISphFieldFilter * pFieldFilter = NULL;

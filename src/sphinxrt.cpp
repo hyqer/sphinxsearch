@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -944,6 +944,8 @@ public:
 	void	Replay ( const SmallStringHash_T<CSphIndex*> & hIndexes, DWORD uReplayFlags, ProgressCallbackSimple_t * pfnProgressCallback );
 
 	void	CreateTimerThread ();
+	bool	IsActive ()			{ return !m_bDisabled; }
+	void	CheckPath ( const CSphConfigSection & hSearchd, bool bTestMode );
 
 private:
 	static const DWORD		BINLOG_VERSION = 4;
@@ -1083,6 +1085,8 @@ private:
 	virtual void				GetPrefixedWords ( const char * sPrefix, int iPrefix, const char * sWildcard, CSphVector<CSphNamedInt> & dPrefixedWords, BYTE * pDictBuf, int iFD ) const;
 	virtual void				GetInfixedWords ( const char * sInfix, int iInfix, const char * sWildcard, CSphVector<CSphNamedInt> & dPrefixedWords ) const;
 
+	bool						RenameWithRollback ( const ESphExt * dExts, int nExts, ESphExtType eExtTypeFrom, ESphExtType eExtTypeTo, CSphString & sError );
+
 public:
 #if USE_WINDOWS
 #pragma warning(push,1)
@@ -1109,6 +1113,8 @@ public:
 	virtual int					UpdateAttributes ( const CSphAttrUpdate & tUpd, int iIndex, CSphString & sError );
 	virtual bool				SaveAttributes ( CSphString & sError ) const { return true; }
 	virtual DWORD				GetAttributeStatus () const { return 0; }
+	virtual bool				CreateFilesWithAttr ( const CSphString & sAttrName, ESphAttr eAttrType, CSphString & sError );
+	virtual bool				AddAttribute ( const CSphString & sAttrName, ESphAttr eAttrType, CSphString & sError );
 
 	virtual void				DebugDumpHeader ( FILE * fp, const char * sHeaderName, bool bConfig ) {}
 	virtual void				DebugDumpDocids ( FILE * fp ) {}
@@ -1124,8 +1130,8 @@ public:
 	virtual const CSphSourceStats &		GetStats () const { return m_tStats; }
 	virtual CSphIndexStatus				GetStatus () const;
 
-	virtual bool				MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag, bool bFactors ) const;
-	virtual bool				MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag, bool bFactors ) const;
+	virtual bool				MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iIndexWeight, int iTag, bool bFactors ) const;
+	virtual bool				MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults, ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iIndexWeight, int iTag, bool bFactors ) const;
 	virtual bool				GetKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, const char * szQuery, bool bGetStats, CSphString & sError ) const;
 
 	void						CopyDocinfo ( CSphMatch & tMatch, const DWORD * pFound ) const;
@@ -1236,7 +1242,7 @@ static int64_t g_iRtFlushPeriod = 10*60*60; // default period is 10 hours
 void RtIndex_t::CheckRamFlush ()
 {
 	int64_t tmSave = sphMicroTimer();
-	if ( m_iTID<=m_iSavedTID || ( tmSave-m_tmSaved )/1000000<g_iRtFlushPeriod )
+	if ( ( g_pRtBinlog->IsActive() && m_iTID<=m_iSavedTID ) || ( tmSave-m_tmSaved )/1000000<g_iRtFlushPeriod )
 		return;
 
 	Verify ( m_tRwlock.ReadLock() );
@@ -1255,7 +1261,7 @@ void RtIndex_t::CheckRamFlush ()
 void RtIndex_t::ForceRamFlush ( bool bPeriodic )
 {
 	int64_t tmSave = sphMicroTimer();
-	if ( m_iTID<=m_iSavedTID )
+	if ( g_pRtBinlog->IsActive() && m_iTID<=m_iSavedTID )
 		return;
 
 	Verify ( m_tRwlock.ReadLock() );
@@ -1389,7 +1395,7 @@ bool RtIndex_t::AddDocument ( int iFields, const char ** ppFields, const CSphMat
 
 	CSphScopedPtr<ISphTokenizer> pTokenizer ( m_pTokenizerIndexing->Clone ( SPH_CLONE_INDEX ) ); // avoid race
 	if ( m_tSettings.m_bAotFilter )
-		pTokenizer = sphAotCreateFilter ( pTokenizer.LeakPtr(), m_pDict ); // OPTIMIZE? do not create filter on each(!) INSERT
+		pTokenizer = sphAotCreateFilter ( pTokenizer.LeakPtr(), m_pDict, m_tSettings.m_bIndexExactWords ); // OPTIMIZE? do not create filter on each(!) INSERT
 
 	CSphSource_StringVector tSrc ( iFields, ppFields, m_tSchema );
 
@@ -3077,13 +3083,13 @@ void RtIndex_t::ForceDiskChunk ()
 
 	Verify ( m_tWriterMutex.Lock() );
 	Verify ( m_tSaveOuterMutex.Lock() );
+	Verify ( m_tRwlock.WriteLock() );
 
 	m_tKlist.Flush();
 	m_dDiskChunkKlist.Reset ( m_tKlist.GetKillListSize() );
-	if ( m_tKlist.GetKillListSize() )
-	{
-		memcpy ( m_dDiskChunkKlist.Begin(), m_tKlist.GetKillList(), sizeof(SphAttr_t)*m_tKlist.GetKillListSize() );
-	}
+	memcpy ( m_dDiskChunkKlist.Begin(), m_tKlist.GetKillList(), sizeof(SphAttr_t)*m_tKlist.GetKillListSize() );
+	Verify ( m_tRwlock.Unlock() );
+
 	SaveDiskChunk ( m_iTID, m_pSegments, m_tStats );
 
 	Verify ( m_tSaveOuterMutex.Unlock() );
@@ -3781,7 +3787,7 @@ CSphIndex * RtIndex_t::LoadDiskChunk ( const char * sChunk, CSphString & sError 
 	MEMORY ( SPH_MEM_IDX_DISK );
 
 	// !COMMIT handle errors gracefully instead of dying
-	CSphIndex * pDiskChunk = sphCreateIndexPhrase ( m_sIndexName.cstr(), sChunk );
+	CSphIndex * pDiskChunk = sphCreateIndexPhrase ( sChunk, sChunk );
 	if ( !pDiskChunk )
 	{
 		sError.SetSprintf ( "disk chunk %s: alloc failed", sChunk );
@@ -3790,6 +3796,7 @@ CSphIndex * RtIndex_t::LoadDiskChunk ( const char * sChunk, CSphString & sError 
 
 	pDiskChunk->SetWordlistPreload ( m_bPreloadWordlist );
 	pDiskChunk->m_iExpansionLimit = m_iExpansionLimit;
+	pDiskChunk->SetBinlog ( false );
 	pDiskChunk->SetEnableStar ( m_bEnableStar );
 
 	CSphString sWarning;
@@ -5634,13 +5641,28 @@ CSphDict * RtIndex_t::SetupStarDict ( CSphScopedPtr<CSphDict> & tContainer, CSph
 	return tContainer.Ptr();
 }
 
+struct CSphAttrTypedLocator : public CSphAttrLocator
+{
+	ESphAttr m_eAttrType;
+	CSphAttrTypedLocator()
+		: m_eAttrType ( SPH_ATTR_NONE )
+	{}
+	inline void Set ( const CSphAttrLocator& tLoc, ESphAttr eAttrType )
+	{
+		m_bDynamic = tLoc.m_bDynamic;
+		m_iBitCount = tLoc.m_iBitCount;
+		m_iBitOffset = tLoc.m_iBitOffset;
+		m_eAttrType = eAttrType;
+	}
+};
+
 
 // FIXME! missing MVA, index_exact_words support
 // FIXME? missing enable_star, legacy match modes support
 // FIXME? any chance to factor out common backend agnostic code?
 // FIXME? do we need to support pExtraFilters?
 bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters,
-	ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> *, int iTag, bool bFactors ) const
+	ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> *, int iIndexWeight, int iTag, bool bFactors ) const
 {
 	assert ( ppSorters );
 
@@ -5750,7 +5772,7 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 		CSphQueryResult tChunkResult;
 		// storing index in matches tag for finding strings attrs offset later, biased against default zero and segments
 		const int iTag = m_pSegments.GetLength()+iChunk+1;
-		if ( !m_pDiskChunks[iChunk]->MultiQuery ( pQuery, &tChunkResult, iSorters, ppSorters, dCumulativeKList.GetLength() ? &dKListFilter : NULL, iTag, bFactors ) )
+		if ( !m_pDiskChunks[iChunk]->MultiQuery ( pQuery, &tChunkResult, iSorters, ppSorters, dCumulativeKList.GetLength() ? &dKListFilter : NULL, iIndexWeight, iTag, bFactors ) )
 		{
 			// FIXME? maybe handle this more gracefully (convert to a warning)?
 			pResult->m_sError = tChunkResult.m_sError;
@@ -5832,10 +5854,8 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 	tTermSetup.m_pSeg = NULL;
 	tTermSetup.m_pCtx = &tCtx;
 
-	int iIndexWeight = pQuery->GetIndexWeight ( m_sIndexName.cstr() );
-
 	// bind weights
-	tCtx.BindWeights ( pQuery, m_tSchema, iIndexWeight );
+	tCtx.BindWeights ( pQuery, m_tSchema );
 
 	// parse query
 	XQQuery_t tParsed;
@@ -5955,7 +5975,7 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 			// FIXME? OPTIMIZE? add shortcuts here too?
 			CSphMatch tMatch;
 			tMatch.Reset ( pResult->m_tSchema.GetDynamicSize() );
-			tMatch.m_iWeight = pQuery->GetIndexWeight ( m_sIndexName.cstr() );
+			tMatch.m_iWeight = iIndexWeight;
 
 			int iCutoff = pQuery->m_iCutoff;
 			if ( iCutoff<=0 )
@@ -5989,11 +6009,11 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 						continue;
 					}
 
+					if ( bRandomize )
+						tMatch.m_iWeight = ( sphRand() & 0xffff ) * iIndexWeight;
+
 					tCtx.CalcSort ( tMatch );
 					tCtx.CalcFinal ( tMatch ); // OPTIMIZE? could be possibly done later
-
-					if ( bRandomize )
-						tMatch.m_iWeight = ( sphRand() & 0xffff );
 
 					// storing segment in matches tag for finding strings attrs offset later, biased against default zero
 					tMatch.m_iTag = iSeg+1;
@@ -6053,11 +6073,12 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 						if ( tCtx.m_bLookupSort )
 							CopyDocinfo ( pMatch[i], FindDocinfo ( m_pSegments[iSeg], pMatch[i].m_iDocID ) );
 
+						pMatch[i].m_iWeight *= iIndexWeight;
+						if ( bRandomize )
+							pMatch[i].m_iWeight = ( sphRand() & 0xffff ) * iIndexWeight;
+
 						tCtx.CalcSort ( pMatch[i] );
 						tCtx.CalcFinal ( pMatch[i] ); // OPTIMIZE? could be possibly done later
-
-						if ( bRandomize )
-							pMatch[i].m_iWeight = ( sphRand() & 0xffff );
 
 						if ( tCtx.m_pWeightFilter && !tCtx.m_pWeightFilter->Eval ( pMatch[i] ) )
 						{
@@ -6096,27 +6117,35 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 	// coping match's attributes to external storage in result set
 	//////////////////////
 
-	CSphVector<CSphAttrLocator> dStringGetLoc;
-	CSphVector<CSphAttrLocator> dStringSetLoc;
-	CSphVector<CSphAttrLocator> dMvaGetLoc;
-	CSphVector<CSphAttrLocator> dMvaSetLoc;
+	CSphVector<CSphAttrTypedLocator> dGetLoc;
+	CSphVector<CSphAttrLocator> dSetLoc;
+	CSphVector<int> dJsonAssoc;
 	for ( int i=0; i<pResult->m_tSchema.GetAttrsCount(); i++ )
 	{
 		const CSphColumnInfo & tSetInfo = pResult->m_tSchema.GetAttr(i);
-		if ( tSetInfo.m_eAttrType==SPH_ATTR_STRING || tSetInfo.m_eAttrType==SPH_ATTR_JSON )
+		if ( tSetInfo.m_eAttrType==SPH_ATTR_STRING || tSetInfo.m_eAttrType==SPH_ATTR_JSON
+			|| tSetInfo.m_eAttrType==SPH_ATTR_UINT32SET || tSetInfo.m_eAttrType==SPH_ATTR_INT64SET )
 		{
 			const int iInLocator = m_tSchema.GetAttrIndex ( tSetInfo.m_sName.cstr() );
 			assert ( iInLocator>=0 );
 
-			dStringGetLoc.Add ( m_tSchema.GetAttr ( iInLocator ).m_tLocator );
-			dStringSetLoc.Add ( tSetInfo.m_tLocator );
-		} else if ( tSetInfo.m_eAttrType==SPH_ATTR_UINT32SET || tSetInfo.m_eAttrType==SPH_ATTR_INT64SET )
+			dGetLoc.Add().Set ( m_tSchema.GetAttr ( iInLocator ).m_tLocator, tSetInfo.m_eAttrType );
+			dSetLoc.Add ( tSetInfo.m_tLocator );
+		}
+	}
+
+	// put the json fields attrs at the very end (surely after all json attrs)
+	for ( int i=0; i<pResult->m_tSchema.GetAttrsCount(); i++ )
+	{
+		const CSphColumnInfo & tSetInfo = pResult->m_tSchema.GetAttr(i);
+		if ( tSetInfo.m_eAttrType==SPH_ATTR_JSON_FIELD )
 		{
-			const int iInLocator = m_tSchema.GetAttrIndex ( tSetInfo.m_sName.cstr() );
+			const int iInLocator = pResult->m_tSchema.GetAttrIndex ( tSetInfo.m_sName.cstr() );
 			assert ( iInLocator>=0 );
 
-			dMvaGetLoc.Add ( m_tSchema.GetAttr ( iInLocator ).m_tLocator );
-			dMvaSetLoc.Add ( tSetInfo.m_tLocator );
+			dGetLoc.Add().Set ( pResult->m_tSchema.GetAttr ( iInLocator ).m_tLocator, SPH_ATTR_JSON_FIELD );
+			dSetLoc.Add ( tSetInfo.m_tLocator );
+			dJsonAssoc.Add ( -1 );
 		}
 	}
 
@@ -6125,7 +6154,7 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 	// during optimize process (disk chunks are merged and removed from RT index)
 	// result set has arena attributes (STRING and MVA) (all these attrs should be at one pool)
 	bool bOptimizing = m_bOptimizing;
-	bool bHasArenaAttrs = ( dStringSetLoc.GetLength()>0 || dMvaSetLoc.GetLength()>0 );
+	bool bHasArenaAttrs = ( dSetLoc.GetLength()>0 );
 	const int iSegmentsTotal = m_pSegments.GetLength();
 	bool bSegmentMatchesFixup = ( m_tSchema.GetStaticSize()>0 && iSegmentsTotal>0 );
 	if ( bSegmentMatchesFixup || bHasArenaAttrs || bOptimizing )
@@ -6208,6 +6237,9 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 		dStorageString.Add ( 0 );
 		dStorageMva.Add ( 0 );
 
+		CSphVector<DWORD> dOriginalJson;
+		CSphVector<DWORD> dMovedJson;
+
 		ARRAY_FOREACH ( iSorter, dSorters )
 		{
 			ISphMatchSorter * pSorter = dSorters[iSorter];
@@ -6227,39 +6259,82 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 				const BYTE * pBaseString = bSegmentMatch ? m_pSegments[iStorageSrc]->m_dStrings.Begin() : dDiskStrings[ iStorageSrc-iSegCount ];
 				const DWORD * pBaseMva = bSegmentMatch ? m_pSegments[iStorageSrc]->m_dMvas.Begin() : dDiskMva[ iStorageSrc-iSegCount ];
 
-				ARRAY_FOREACH ( i, dStringGetLoc )
-				{
-					DWORD uAttr = 0;
-					const SphAttr_t uOff = tMatch.GetAttr ( dStringGetLoc[i] );
-					if ( uOff>0 ) // have to fix up only existed attribute
-					{
-						assert ( uOff<( I64C(1)<<32 ) ); // should be 32 bit offset
-						assert ( !bSegmentMatch || (int)uOff<m_pSegments[iStorageSrc]->m_dStrings.GetLength() );
+				int iJson = 0;
+				dOriginalJson.Reset();
+				dMovedJson.Reset();
 
-						uAttr = CopyPackedString ( pBaseString + uOff, dStorageString );
+				ARRAY_FOREACH ( i, dGetLoc )
+				{
+					int64_t iAttr = 0;
+					const CSphAttrTypedLocator& tLoc = dGetLoc[i];
+
+					switch ( tLoc.m_eAttrType )
+					{
+					case SPH_ATTR_STRING:
+					case SPH_ATTR_JSON:
+						{
+							const SphAttr_t uOff = tMatch.GetAttr ( tLoc );
+							if ( uOff>0 )
+							{
+								assert ( uOff<( I64C(1)<<32 ) ); // should be 32 bit offset
+								assert ( !bSegmentMatch || (int)uOff<m_pSegments[iStorageSrc]->m_dStrings.GetLength() );
+								iAttr = CopyPackedString ( pBaseString + uOff, dStorageString );
+								// store the map of full jsons in order to map json fields
+								if ( tLoc.m_eAttrType==SPH_ATTR_JSON )
+								{
+									dOriginalJson.Add ( (DWORD)uOff );
+									dMovedJson.Add ( iAttr );
+								}
+							}
+						}
+						break;
+					case SPH_ATTR_UINT32SET:
+					case SPH_ATTR_INT64SET:
+						{
+							const DWORD * pMva = tMatch.GetAttrMVA ( tLoc, pBaseMva );
+							// have to fix up only existed attribute
+							if ( pMva )
+							{
+								assert ( ( tMatch.GetAttr ( tLoc ) & MVA_ARENA_FLAG )<( I64C(1)<<32 ) ); // should be 32 bit offset
+								assert ( !bSegmentMatch || (int)tMatch.GetAttr ( tLoc )<m_pSegments[iStorageSrc]->m_dMvas.GetLength() );
+								iAttr = CopyMva ( pMva, dStorageMva );
+							}
+						}
+						break;
+					case SPH_ATTR_JSON_FIELD:
+						{
+							iAttr = tMatch.GetAttr ( tLoc );
+							if ( iAttr )
+							{
+								ESphJsonType eJson = ESphJsonType ( iAttr>>32 );
+								DWORD uOff = (DWORD)iAttr;
+								if ( dJsonAssoc[iJson]<0 )
+								{
+									// tricky part. We have packed json field, but it points somewhere into original json.
+									// since all jsons already relocated, we have to find the original (source) and recalculate the locator
+									int k = -1;
+									int iDistance = -1;
+									ARRAY_FOREACH ( j, dOriginalJson )
+										if ( iDistance < 0 || ( uOff - dOriginalJson[j]>=0 && uOff - dOriginalJson[j] < iDistance ) )
+										{
+											iDistance = uOff - dOriginalJson[j];
+											k = j;
+										}
+									assert ( k>=0 );
+									dJsonAssoc[iJson] = k;
+								}
+								DWORD uNew = dMovedJson[dJsonAssoc[iJson]] - dOriginalJson[dJsonAssoc[iJson]] + uOff;
+								++iJson;
+								iAttr = ( ( (int64_t)uNew ) | ( ( (int64_t)eJson )<<32 ) );
+							}
+						}
+					default:
+						break;
 					}
 
-					const CSphAttrLocator & tSet = dStringSetLoc[i];
+					const CSphAttrLocator & tSet = dSetLoc[i];
 					assert ( !tSet.m_bDynamic || tSet.GetMaxRowitem() < (int)tMatch.m_pDynamic[-1] );
-					sphSetRowAttr ( tSet.m_bDynamic ? tMatch.m_pDynamic : const_cast<CSphRowitem*>( tMatch.m_pStatic ), tSet, uAttr );
-				}
-
-				ARRAY_FOREACH ( i, dMvaGetLoc )
-				{
-					DWORD uAttr = 0;
-					const DWORD * pMva = tMatch.GetAttrMVA ( dMvaGetLoc[i], pBaseMva );
-					// have to fix up only existed attribute
-					if ( pMva )
-					{
-						assert ( ( tMatch.GetAttr ( dMvaGetLoc[i] ) & MVA_ARENA_FLAG )<( I64C(1)<<32 ) ); // should be 32 bit offset
-						assert ( !bSegmentMatch || (int)tMatch.GetAttr ( dMvaGetLoc[i] )<m_pSegments[iStorageSrc]->m_dMvas.GetLength() );
-
-						uAttr = CopyMva ( pMva, dStorageMva );
-					}
-
-					const CSphAttrLocator & tSet = dMvaSetLoc[i];
-					assert ( !tSet.m_bDynamic || tSet.GetMaxRowitem() < (int)tMatch.m_pDynamic[-1] );
-					sphSetRowAttr ( tSet.m_bDynamic ? tMatch.m_pDynamic : const_cast<CSphRowitem*>( tMatch.m_pStatic ), tSet, uAttr );
+					sphSetRowAttr ( tSet.m_bDynamic ? tMatch.m_pDynamic : const_cast<CSphRowitem*>( tMatch.m_pStatic ), tSet, iAttr );
 				}
 			}
 		}
@@ -6285,12 +6360,12 @@ bool RtIndex_t::MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult
 }
 
 bool RtIndex_t::MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults,
-	ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iTag, bool bFactors ) const
+								ISphMatchSorter ** ppSorters, const CSphVector<CSphFilterSettings> * pExtraFilters, int iIndexWeight, int iTag, bool bFactors ) const
 {
 	// FIXME! OPTIMIZE! implement common subtree cache here
 	bool bResult = false;
 	for ( int i=0; i<iQueries; i++ )
-		if ( MultiQuery ( &ppQueries[i], ppResults[i], 1, &ppSorters[i], pExtraFilters, iTag, bFactors ) )
+		if ( MultiQuery ( &ppQueries[i], ppResults[i], 1, &ppSorters[i], pExtraFilters, iIndexWeight, iTag, bFactors ) )
 			bResult = true;
 		else
 			ppResults[i]->m_iMultiplier = -1;
@@ -6645,12 +6720,208 @@ int RtIndex_t::UpdateAttributes ( const CSphAttrUpdate & tUpd, int iIndex, CSphS
 	return iUpdated;
 }
 
+static bool RenameChunk ( const char * sIndex, const char * sPrefix, const char * sFromPostfix, const char * sToPostfix )
+{
+	char sFrom [ SPH_MAX_FILENAME_LEN ];
+	char sTo [ SPH_MAX_FILENAME_LEN ];
+
+	snprintf ( sFrom, sizeof(sFrom), "%s%s", sPrefix, sFromPostfix );
+	snprintf ( sTo, sizeof(sTo), "%s%s", sPrefix, sToPostfix );
+
+#if USE_WINDOWS
+	::unlink ( sTo );
+#endif
+
+	if ( rename ( sFrom, sTo ) )
+	{
+		sphWarning ( "adding attribute to index '%s': rename '%s' to '%s' failed: %s", sIndex, sFrom, sTo, strerror(errno) );
+		return false;
+	}
+
+	return true;
+}
+
+bool RtIndex_t::RenameWithRollback ( const ESphExt * dExts, int nExts, ESphExtType eExtTypeFrom, ESphExtType eExtTypeTo, CSphString & sError )
+{
+	CSphString sChunk;
+	int iFailedChunk = -1;
+	int iFailedExt = -1;
+	ARRAY_FOREACH_COND ( iDiskChunk, m_pDiskChunks, iFailedChunk==-1 )
+	{
+		sChunk.SetSprintf ( "%s.%d", m_sPath.cstr(), iDiskChunk+m_iDiskBase );
+		for ( int iExt = 0; iExt < nExts&& iFailedExt==-1; iExt++ )
+			if ( !RenameChunk ( m_sIndexName.cstr(), sChunk.cstr(), sphGetExt ( eExtTypeFrom, dExts[iExt] ), sphGetExt ( eExtTypeTo, dExts[iExt] ) ) )
+				iFailedExt = iExt;
+
+		// failed? rollback last chunk
+		if ( iFailedExt!=-1 )
+		{
+			sError.SetSprintf ( "adding attribute to RT index '%s, chunk %s': rename failed; using old index", m_sIndexName.cstr(), sChunk.cstr() );
+			for ( int iExt = iFailedExt; iExt>=0; iExt-- )
+				RenameChunk ( m_sIndexName.cstr(), sChunk.cstr(), sphGetExt ( eExtTypeTo, dExts[iExt] ), sphGetExt ( eExtTypeFrom, dExts[iExt] ) );
+
+			iFailedChunk = iDiskChunk-1;
+		}
+	}
+
+	// failed? rollback all chunks
+	for ( int iDiskChunk = iFailedChunk; iDiskChunk>=0; iDiskChunk-- )
+		for ( int iExt = 0; iExt < nExts; iExt++ )
+			RenameChunk ( m_sIndexName.cstr(), sChunk.cstr(), sphGetExt ( eExtTypeTo, dExts[iExt] ), sphGetExt ( eExtTypeFrom, dExts[iExt] ) );
+
+	return iFailedChunk==-1 && iFailedExt==-1;
+}
+
+bool RtIndex_t::CreateFilesWithAttr ( const CSphString & sAttrName, ESphAttr eAttrType, CSphString & sError )
+{
+	// fixme: use some unified approach to these exts
+	const int NUM_EXTS_USED = 2;
+	const ESphExt dExtsUsed[NUM_EXTS_USED] = { SPH_EXT_SPH, SPH_EXT_SPA };
+
+	if ( !m_pDiskChunks.GetLength() )
+		return true;
+
+	// disk chunks must have attributes
+	if ( !m_tSchema.GetAttrsCount() )
+	{
+		sError = "index must already have attributes";
+		return false;
+	}
+
+	m_tRwlock.ReadLock();
+
+	if ( m_tSchema.GetAttr ( sAttrName.cstr() ) )
+	{
+		sError.SetSprintf ( "'%s' attribute already in schema", sAttrName.cstr() );
+		m_tRwlock.Unlock();
+		return false;
+	}
+
+	int iFailedChunk = -1;
+	ARRAY_FOREACH_COND ( iDiskChunk, m_pDiskChunks, iFailedChunk==-1 )
+		if ( !m_pDiskChunks[iDiskChunk]->CreateFilesWithAttr ( sAttrName.cstr(), eAttrType, sError ) )
+			iFailedChunk = iDiskChunk;
+
+	// cleanup if failed
+	char sFileName[SPH_MAX_FILENAME_LEN];
+	for ( int iDiskChunk = iFailedChunk; iDiskChunk>=0; iDiskChunk-- )
+		for ( int iExt = 0; iExt < NUM_EXTS_USED; iExt++ )
+		{
+			snprintf ( sFileName, sizeof(sFileName), "%s.%d%s", m_sPath.cstr(), iDiskChunk+m_iDiskBase, sphGetExt ( SPH_EXT_TYPE_NEW, dExtsUsed[iExt] ) );
+
+			if ( ::unlink ( sFileName ) && errno!=ENOENT )
+				sphWarning ( "unlink failed (file '%s', error '%s'", sFileName, strerror(errno) );
+		}
+
+	if ( iFailedChunk!=-1 )
+	{
+		m_tRwlock.Unlock();
+		return false;
+	}
+
+	// current to old
+	if ( !RenameWithRollback ( dExtsUsed, NUM_EXTS_USED, SPH_EXT_TYPE_CUR, SPH_EXT_TYPE_OLD, sError ) )
+	{
+		m_tRwlock.Unlock();
+		return false;
+	}
+
+	if ( !RenameWithRollback ( dExtsUsed, NUM_EXTS_USED, SPH_EXT_TYPE_NEW, SPH_EXT_TYPE_CUR, sError ) )
+	{
+		m_tRwlock.Unlock();
+		return false;
+	}
+
+	// unlink old
+	ARRAY_FOREACH ( iDiskChunk, m_pDiskChunks )
+		for ( int iExt = 0; iExt < NUM_EXTS_USED; iExt++ )
+		{
+			snprintf ( sFileName, sizeof(sFileName), "%s.%d%s", m_sPath.cstr(), iDiskChunk+m_iDiskBase, sphGetExt ( SPH_EXT_TYPE_OLD, dExtsUsed[iExt] ) );
+			if ( ::unlink ( sFileName ) && errno!=ENOENT )
+				sphWarning ( "unlink failed (file '%s', error '%s'", sFileName, strerror(errno) );
+		}
+
+	m_tRwlock.Unlock();
+
+	return true;
+}
+
+bool RtIndex_t::AddAttribute ( const CSphString & sAttrName, ESphAttr eAttrType, CSphString & sError )
+{
+	if ( m_tSchema.GetAttr ( sAttrName.cstr() ) )
+	{
+		sError.SetSprintf ( "'%s' attribute already in schema", sAttrName.cstr() );
+		return false;
+	}
+
+	if ( m_pDiskChunks.GetLength() && !m_tSchema.GetAttrsCount() )
+	{
+		sError = "index must already have attributes";
+		return false;
+	}
+
+	m_tRwlock.WriteLock();
+
+	int iOldStride = m_iStride;
+
+	CSphColumnInfo tInfo ( sAttrName.cstr(), eAttrType );
+	m_tSchema.AddAttr ( tInfo, false );
+	const CSphColumnInfo * pNewAttr = m_tSchema.GetAttr ( sAttrName.cstr() );
+
+	m_iStride = DOCINFO_IDSIZE + m_tSchema.GetRowSize();
+
+	// modify the in-memory data of disk chunks
+	// fixme: we can't rollback in-memory changes, so we just show errors here for now
+	ARRAY_FOREACH ( iDiskChunk, m_pDiskChunks )
+		if ( !m_pDiskChunks[iDiskChunk]->AddAttribute ( sAttrName, eAttrType, sError ) )
+			sphWarning ( "adding attribute to %s.%d: %s", m_sPath.cstr(), iDiskChunk+m_iDiskBase, sError.cstr() );
+
+	// now modify the ramchunk
+	ARRAY_FOREACH ( iSegment, m_pSegments )
+	{
+		RtSegment_t * pSeg = m_pSegments[iSegment];
+		assert ( pSeg );
+		CSphTightVector<CSphRowitem> dNewRows;
+		dNewRows.Resize ( pSeg->m_dRows.GetLength() / iOldStride * m_iStride );
+		CSphRowitem * pOldDocinfo = pSeg->m_dRows.Begin();
+		CSphRowitem * pOldDocinfoEnd = pOldDocinfo+pSeg->m_dRows.GetLength();
+		CSphRowitem * pNewDocinfo = dNewRows.Begin();
+
+		while ( pOldDocinfo < pOldDocinfoEnd )
+		{
+			SphDocID_t tDocId = DOCINFO2ID ( pOldDocinfo );
+			DWORD * pAttrs = DOCINFO2ATTRS ( pOldDocinfo );
+			memcpy ( DOCINFO2ATTRS ( pNewDocinfo ), pAttrs, m_tSchema.GetRowSize()*sizeof(CSphRowitem) );
+			sphSetRowAttr ( DOCINFO2ATTRS ( pNewDocinfo ), pNewAttr->m_tLocator, 0 );
+			DOCINFOSETID ( pNewDocinfo, tDocId );
+			pOldDocinfo += iOldStride;
+			pNewDocinfo += m_iStride;
+		}
+
+		pSeg->m_dRows.SwapData ( dNewRows );
+	}
+
+	// fixme: we can't rollback at this point
+	Verify ( SaveRamChunk () );
+
+	SaveMeta ( m_pDiskChunks.GetLength(), m_iTID );
+
+	// fixme: notify that it was ALTER that caused the flush
+	g_pBinlog->NotifyIndexFlush ( m_sIndexName.cstr(), m_iTID, false );
+
+	m_tRwlock.Unlock();
+
+	return true;
+}
+
 //////////////////////////////////////////////////////////////////////////
 // MAGIC CONVERSIONS
 //////////////////////////////////////////////////////////////////////////
 
 bool RtIndex_t::AttachDiskIndex ( CSphIndex * pIndex, CSphString & sError )
 {
+	bool bEmptyRT = ( !m_pSegments.GetLength() && !m_pDiskChunks.GetLength() );
+
 	// safeguards
 	// we do not support some of the disk index features in RT just yet
 #define LOC_ERROR(_arg) { sError = _arg; return false; }
@@ -6661,48 +6932,117 @@ bool RtIndex_t::AttachDiskIndex ( CSphIndex * pIndex, CSphString & sError )
 		LOC_ERROR ( "ATTACH currently requires stopword_step=1 in disk index (RT-side support not implemented yet)" );
 	if ( tSettings.m_eDocinfo!=SPH_DOCINFO_EXTERN )
 		LOC_ERROR ( "ATTACH currently requires docinfo=extern in disk index (RT-side support not implemented yet)" );
+	// ATTACH to exist index require these checks
+	if ( !bEmptyRT )
+	{
+		if ( m_pTokenizer->GetSettingsFNV()!=pIndex->GetTokenizer()->GetSettingsFNV() )
+			LOC_ERROR ( "ATTACH currently requires same tokenizer settings (RT-side support not implemented yet)" );
+		if ( m_pDict->GetSettingsFNV()!=pIndex->GetDictionary()->GetSettingsFNV() )
+			LOC_ERROR ( "ATTACH currently requires same dictionary settings (RT-side support not implemented yet)" );
+		if ( !GetMatchSchema().CompareTo ( pIndex->GetMatchSchema(), sError, true ) )
+			LOC_ERROR ( "ATTACH currently requires same attributes declaration (RT-side support not implemented yet)" );
+	}
 #undef LOC_ERROR
 
-	// ATTACH needs an exclusive global lock on both indexes
-	// source disk index must come in locked internally
-	// target RT index lock is acquired here
-	Verify ( m_tWriterMutex.Lock() );
-	Verify ( m_tSaveOuterMutex.Lock() );
-	Verify ( m_tRwlock.WriteLock() );
-
-	// for now, let's do the simplest possible thing
-	// and attach new data to empty RT indexes only
-	bool bHasData = ( m_pDiskChunks.GetLength()!=0 );
-	ARRAY_FOREACH_COND ( i, m_pSegments, !bHasData )
-		bHasData = ( m_pSegments[i]->m_iAliveRows!=0 );
-
-	if ( bHasData )
+	if ( !bEmptyRT )
 	{
-		Verify ( m_tRwlock.Unlock() );
-		Verify ( m_tSaveOuterMutex.Unlock() );
-		Verify ( m_tWriterMutex.Unlock() );
-		sError.SetSprintf ( "ATTACH currently supports empty target RT indexes only" );
-		return false;
+		SphAttr_t * pIndexDocList = NULL;
+		int64_t iCount = 0;
+		if ( !pIndex->BuildDocList ( &pIndexDocList, &iCount, &sError ) )
+		{
+			sError.SetSprintf ( "ATTACH failed, %s", sError.cstr() );
+			return false;
+		}
+
+		// new[] might fail on 32bit here
+		// sphSort is 32bit too
+		int64_t iSizeMax = (size_t)( iCount + pIndex->GetKillListSize() );
+		if ( iCount + pIndex->GetKillListSize()!=iSizeMax )
+		{
+			SafeDeleteArray ( pIndexDocList );
+			sError.SetSprintf ( "ATTACH failed, documents overflow (count="INT64_FMT", size max="INT64_FMT")", iCount + pIndex->GetKillListSize(), iSizeMax );
+			return false;
+		}
+
+		SphAttr_t * pCombined = new SphAttr_t[(size_t)( iCount + pIndex->GetKillListSize() )];
+		memcpy ( pCombined, pIndexDocList, (size_t)( sizeof(SphAttr_t) * iCount ) );
+		memcpy ( pCombined+iCount, pIndex->GetKillList(), sizeof(SphAttr_t) * pIndex->GetKillListSize() );
+		iCount += pIndex->GetKillListSize();
+		SafeDeleteArray ( pIndexDocList );
+
+		// lock-less ForceDiskChunk
+		m_tKlist.Flush();
+		m_dDiskChunkKlist.Reset ( m_tKlist.GetKillListSize() );
+		memcpy ( m_dDiskChunkKlist.Begin(), m_tKlist.GetKillList(), sizeof(SphAttr_t)*m_tKlist.GetKillListSize() );
+
+		SaveDiskChunk ( m_iTID, m_pSegments, m_tStats );
+
+		// kill-list drying up
+		for ( int iIndex=m_pDiskChunks.GetLength()-1; iIndex>=0 && iCount; iIndex-- )
+		{
+			const CSphIndex * pIndex = m_pDiskChunks[iIndex];
+			for ( int i=0; i<iCount; i++ )
+			{
+				SphAttr_t uDocid = pCombined[i];
+				if ( !pIndex->HasDocid ( (SphDocID_t)uDocid ) )
+					continue;
+
+				// we just found the most recent chunk with our suspect docid
+				// let's check whether it's already killed by subsequent chunks, or gets killed now
+				bool bKeep = true;
+				for ( int k=i+1; k<m_pDiskChunks.GetLength() && bKeep; k++ )
+				{
+					const CSphIndex * pKilled = m_pDiskChunks[k];
+					bKeep = ( sphBinarySearch ( pKilled->GetKillList(), pKilled->GetKillList() + pKilled->GetKillListSize() - 1, uDocid )==NULL );
+				}
+
+				if ( !bKeep )
+				{
+					// RemoveFast
+					pCombined[i] = pCombined[iCount-1];
+					iCount--;
+				}
+			}
+		}
+
+		// sort by id and got rid of duplicates
+		sphSort ( pCombined, (int)iCount );
+		iCount = sphUniq ( pCombined, iCount );
+
+		iSizeMax = (size_t)iCount;
+		if ( iCount!=iSizeMax )
+		{
+			SafeDeleteArray ( pCombined );
+			sError.SetSprintf ( "ATTACH failed, kill-list overflow (size="INT64_FMT", size max="INT64_FMT")", iCount, iSizeMax );
+			return false;
+		}
+
+		bool bKillistDone = pIndex->ReplaceKillist ( pCombined, (int)iCount );
+		SafeDeleteArray ( pCombined );
+
+		if ( !bKillistDone )
+		{
+			sError.SetSprintf ( "ATTACH failed, kill-list replacement error (error='%s', warning='%s'", pIndex->GetLastError().cstr(), pIndex->GetLastWarning().cstr() );
+			return false;
+		}
 	}
 
-	// rename that source index to our chunk0
+	// rename that source index to our last chunk
 	CSphString sChunk;
-	sChunk.SetSprintf ( "%s.0", m_sPath.cstr() );
+	sChunk.SetSprintf ( "%s.%d", m_sPath.cstr(), m_pDiskChunks.GetLength()+m_iDiskBase );
 	if ( !pIndex->Rename ( sChunk.cstr() ) )
 	{
-		Verify ( m_tRwlock.Unlock() );
-		Verify ( m_tSaveOuterMutex.Unlock() );
-		Verify ( m_tWriterMutex.Unlock() );
-		sError.SetSprintf ( "ATTACH failed: %s", pIndex->GetLastError().cstr() );
+		sError.SetSprintf ( "ATTACH failed, %s", pIndex->GetLastError().cstr() );
 		return false;
 	}
 
-	// copy schema from chunk0 schema
+	// copy schema from new index
 	m_tSchema = pIndex->GetMatchSchema();
-	m_tStats = pIndex->GetStats();
 	m_iStride = DOCINFO_IDSIZE + m_tSchema.GetRowSize();
+	m_tStats.m_iTotalBytes += pIndex->GetStats().m_iTotalBytes;
+	m_tStats.m_iTotalDocuments += pIndex->GetStats().m_iTotalDocuments;
 
-	// copy tokenizer, dict etc settings from chunk0
+	// copy tokenizer, dict etc settings from new index
 	SafeDelete ( m_pTokenizer );
 	SafeDelete ( m_pDict );
 
@@ -6713,11 +7053,14 @@ bool RtIndex_t::AttachDiskIndex ( CSphIndex * pIndex, CSphString & sError )
 	m_pTokenizer = pIndex->GetTokenizer()->Clone ( SPH_CLONE_INDEX );
 	m_pDict = pIndex->GetDictionary()->Clone ();
 	PostSetup();
+	CSphString sName;
+	sName.SetSprintf ( "%s_%d", m_sIndexName.cstr(), m_pDiskChunks.GetLength() );
+	pIndex->SetName ( sName.cstr() );
+	pIndex->SetBinlog ( false );
 
 	// FIXME? what about copying m_TID etc?
 
 	// recreate disk chunk list, resave header file
-	m_iDiskBase = 0;
 	m_pDiskChunks.Add ( pIndex );
 	SaveMeta ( m_pDiskChunks.GetLength(), m_iTID );
 
@@ -6725,9 +7068,6 @@ bool RtIndex_t::AttachDiskIndex ( CSphIndex * pIndex, CSphString & sError )
 	// g_pBinlog->NotifyIndexFlush ( m_sIndexName.cstr(), m_iTID, false );
 
 	// all done
-	Verify ( m_tRwlock.Unlock() );
-	Verify ( m_tSaveOuterMutex.Unlock() );
-	Verify ( m_tWriterMutex.Unlock() );
 	return true;
 }
 
@@ -6810,6 +7150,9 @@ void RtIndex_t::Optimize ( volatile bool * pForceTerminate, ThrottleState_t * pT
 		// add disk chunks kill-lists
 		for ( int iChunk=1; iChunk<m_pDiskChunks.GetLength(); iChunk++ )
 		{
+			if ( *pForceTerminate )
+				break;
+
 			const CSphIndex * pIndex = m_pDiskChunks[iChunk];
 			if ( !pIndex->GetKillListSize() )
 				continue;
@@ -6857,7 +7200,7 @@ void RtIndex_t::Optimize ( volatile bool * pForceTerminate, ThrottleState_t * pT
 
 		// merge data to disk ( data is constant during that phase )
 		CSphIndexProgress tProgress;
-		bool bMerged = sphMerge ( pOldest, pOlder, pFilter.Ptr(), sError, tProgress, pThrottle );
+		bool bMerged = sphMerge ( pOldest, pOlder, pFilter.Ptr(), sError, tProgress, pThrottle, pForceTerminate );
 		if ( !bMerged )
 		{
 			sphWarning ( "rt optimize: index %s: failed to merge %s to %s (error %s)",
@@ -6939,8 +7282,15 @@ void RtIndex_t::Optimize ( volatile bool * pForceTerminate, ThrottleState_t * pT
 	m_bOptimizing = false;
 	int64_t tmPass = sphMicroTimer() - tmStart;
 
-	sphInfo ( "rt: index %s: optimized chunk(s) %d ( of %d ) in %d.%03d sec",
-		m_sIndexName.cstr(), iChunks-m_pDiskChunks.GetLength(), iChunks, (int)(tmPass/1000000), (int)((tmPass/1000)%1000) );
+	if ( *pForceTerminate )
+	{
+		sphWarning ( "rt: index %s: optimization terminated chunk(s) %d ( of %d ) in %d.%03d sec",
+			m_sIndexName.cstr(), iChunks-m_pDiskChunks.GetLength(), iChunks, (int)(tmPass/1000000), (int)((tmPass/1000)%1000) );
+	} else
+	{
+		sphInfo ( "rt: index %s: optimized chunk(s) %d ( of %d ) in %d.%03d sec",
+			m_sIndexName.cstr(), iChunks-m_pDiskChunks.GetLength(), iChunks, (int)(tmPass/1000000), (int)((tmPass/1000)%1000) );
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -8145,6 +8495,22 @@ bool RtBinlog_c::ReplayCacheAdd ( int iBinlog, BinlogReader_c & tReader ) const
 	return true;
 }
 
+void RtBinlog_c::CheckPath ( const CSphConfigSection & hSearchd, bool bTestMode )
+{
+#ifndef DATADIR
+#define DATADIR "."
+#endif
+
+	m_sLogPath = hSearchd.GetStr ( "binlog_path", bTestMode ? "" : DATADIR );
+	m_bDisabled = m_sLogPath.IsEmpty();
+
+	if ( !m_bDisabled )
+	{
+		LockFile ( true );
+		LockFile ( false );
+	}
+}
+
 //////////////////////////////////////////////////////////////////////////
 
 ISphRtIndex * sphGetCurrentIndexRT()
@@ -8163,7 +8529,7 @@ ISphRtIndex * sphCreateIndexRT ( const CSphSchema & tSchema, const char * sIndex
 }
 
 
-void sphRTInit ()
+void sphRTInit ( const CSphConfigSection & hSearchd, bool bTestMode )
 {
 	MEMORY ( SPH_MEM_BINLOG );
 
@@ -8174,6 +8540,9 @@ void sphRTInit ()
 	if ( !g_pRtBinlog )
 		sphDie ( "binlog: failed to create binlog" );
 	g_pBinlog = g_pRtBinlog;
+
+	// check binlog path before detaching from the console
+	g_pRtBinlog->CheckPath ( hSearchd, bTestMode );
 }
 
 

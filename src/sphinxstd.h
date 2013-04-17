@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -678,6 +678,25 @@ T * sphBinarySearch ( T * pStart, T * pEnd, T & tRef )
 	return sphBinarySearch ( pStart, pEnd, SphIdentityFunctor_T<T>(), tRef );
 }
 
+/// generic uniq
+template < typename T, typename T_COUNTER >
+T_COUNTER sphUniq ( T * pData, T_COUNTER iCount )
+{
+	if ( !iCount )
+		return 0;
+
+	T_COUNTER iSrc = 1, iDst = 1;
+	while ( iSrc<iCount )
+	{
+		if ( pData[iDst-1]==pData[iSrc] )
+			iSrc++;
+		else
+			pData[iDst++] = pData[iSrc++];
+	}
+	return iDst;
+}
+
+
 //////////////////////////////////////////////////////////////////////////
 
 /// default vector policy
@@ -898,17 +917,8 @@ public:
 			return;
 
 		Sort ();
-
-		int iSrc = 0, iDst = 0;
-		while ( iSrc<m_iLength )
-		{
-			if ( iDst>0 && m_pData[iDst-1]==m_pData[iSrc] )
-				iSrc++;
-			else
-				m_pData[iDst++] = m_pData[iSrc++];
-		}
-
-		Resize ( iDst );
+		int iLeft = sphUniq ( m_pData, m_iLength );
+		Resize ( iLeft );
 	}
 
 	/// default sort
@@ -1766,6 +1776,92 @@ inline void Swap ( CSphString & v1, CSphString & v2 )
 	v1.Swap ( v2 );
 }
 
+
+/// string builder
+/// somewhat quicker than a series of SetSprintf()s
+/// lets you build strings bigger than 1024 bytes, too
+class CSphStringBuilder
+{
+protected:
+	char *	m_sBuffer;
+	int		m_iSize;
+	int		m_iUsed;
+	bool	m_bFirstSeparator;
+
+public:
+	CSphStringBuilder()
+	{
+		Reset();
+	}
+
+	void Reset()
+	{
+		m_iSize = 256;
+		m_iUsed = 0;
+		m_sBuffer = new char [ m_iSize ];
+		m_sBuffer[0] = '\0';
+		m_bFirstSeparator = true;
+	}
+
+	CSphStringBuilder & Appendf ( const char * sTemplate, ... ) __attribute__ ( ( format ( printf, 2, 3 ) ) )
+	{
+		assert ( m_sBuffer );
+		assert ( m_iUsed<m_iSize );
+
+		for ( ;; )
+		{
+			int iLeft = m_iSize - m_iUsed;
+
+			// try to append
+			va_list ap;
+			va_start ( ap, sTemplate );
+			int iPrinted = vsnprintf ( m_sBuffer+m_iUsed, iLeft, sTemplate, ap );
+			va_end ( ap );
+
+			// success? bail
+			// note that we check for strictly less, not less or equal
+			// that is because vsnprintf does *not* count the trailing zero
+			// meaning that if we had N bytes left, and N bytes w/o the zero were printed,
+			// we do not have a trailing zero anymore, but vsnprintf succeeds anyway
+			if ( iPrinted>=0 && iPrinted<iLeft )
+			{
+				m_iUsed += iPrinted;
+				break;
+			}
+
+			// we need more chars!
+			if ( iPrinted<0 )
+				m_iSize += 256; // happens on Windows; lets assume we need 256 more chars
+			else
+				m_iSize += ( iPrinted - iLeft + 64 ); // get all the needed chars and 64 more for future calls
+
+			char * pNew = new char [ m_iSize ];
+			memcpy ( pNew, m_sBuffer, m_iUsed+1 );
+			Swap ( pNew, m_sBuffer );
+			SafeDeleteArray ( pNew );
+		}
+		return *this;
+	}
+
+	void ResetSeparator ()
+	{
+		m_bFirstSeparator = true;
+	}
+
+	CSphStringBuilder & AppendSeparator ( const char * sSep )
+	{
+		if ( !m_bFirstSeparator )
+			Appendf ( "%s", sSep ); // OPTIMIZE?
+		m_bFirstSeparator = false;
+		return *this;
+	}
+
+	const char * cstr() const
+	{
+		return m_sBuffer;
+	}
+};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// immutable string/int/float variant list proxy
@@ -2117,6 +2213,14 @@ public:
 		return m_iEntries;
 	}
 
+	void Swap ( CSphSharedBuffer & tBuf )
+	{
+		::Swap ( m_pData, tBuf.m_pData );
+		::Swap ( m_iLength, tBuf.m_iLength );
+		::Swap ( m_iEntries, tBuf.m_iEntries );
+		::Swap ( m_bMlock, tBuf.m_bMlock );
+	}
+
 protected:
 	T *					m_pData;	///< data storage
 	size_t				m_iLength;	///< data length, bytes
@@ -2393,8 +2497,10 @@ public:
 	CSphRwlock ();
 	~CSphRwlock () {}
 
-	bool Init ();
+	bool Init ( bool bProcessShared = false );
 	bool Done ();
+
+	const char * GetError () const;
 
 	bool ReadLock ();
 	bool WriteLock ();
@@ -2402,6 +2508,7 @@ public:
 
 private:
 	bool				m_bInitialized;
+	CSphString			m_sError;
 #if USE_WINDOWS
 	HANDLE				m_hWriteMutex;
 	HANDLE				m_hReadEvent;
@@ -2631,35 +2738,6 @@ public:
 	}
 };
 
-/// generic COM-like uids
-enum ExtraData_e
-{
-	EXTRA_GET_DATA_ZONESPANS,
-	EXTRA_GET_DATA_ZONESPANLIST,
-	EXTRA_GET_DATA_RANKFACTORS,
-	EXTRA_GET_DATA_PACKEDFACTORS,
-	EXTRA_SET_MVAPOOL,
-	EXTRA_SET_STRINGPOOL,
-	EXTRA_SET_MAXMATCHES,
-	EXTRA_SET_MATCHPUSHED,
-	EXTRA_SET_MATCHPOPPED
-};
-
-/// generic COM-like interface
-class ISphExtra
-{
-public:
-	virtual						~ISphExtra () {}
-	inline bool					ExtraData	( ExtraData_e eType, void** ppData )
-	{
-		return ExtraDataImpl ( eType, ppData );
-	}
-private:
-	virtual bool ExtraDataImpl ( ExtraData_e, void** )
-	{
-		return false;
-	}
-};
 
 #endif // _sphinxstd_
 

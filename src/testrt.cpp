@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -51,7 +51,7 @@ void DoSearch ( CSphIndex * pIndex )
 	{
 		printf ( "failed to create sorter; error=%s", tResult.m_sError.cstr() );
 
-	} else if ( !pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL ) )
+	} else if ( !pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL, 1 ) )
 	{
 		printf ( "query failed; error=%s", pIndex->GetLastError().cstr() );
 
@@ -205,7 +205,7 @@ int main ( int argc, char ** argv )
 		tSchema.AddAttr ( tSrcSchema.GetAttr(i), false );
 
 	CSphConfigSection tRTConfig;
-	sphRTInit();
+	sphRTInit ( tRTConfig, true );
 	sphRTConfigure ( tRTConfig, true );
 	SmallStringHash_T< CSphIndex * > dTemp;
 	sphReplayBinlog ( dTemp, 0 );

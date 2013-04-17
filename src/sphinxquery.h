@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -19,14 +19,6 @@
 #include "sphinx.h"
 
 //////////////////////////////////////////////////////////////////////////////
-
-enum XQStarPosition
-{
-	STAR_NONE	= 0,
-	STAR_FRONT	= 1,
-	STAR_BACK	= 2,
-	STAR_BOTH	= 3
-};
 
 /// extended query word with attached position within atom
 struct XQKeyword_t
@@ -98,6 +90,11 @@ public:
 		m_bZoneSpan = false;
 		m_dFieldMask.Set();
 		m_dZones.Reset();
+	}
+
+	bool IsEmpty() const
+	{
+		return m_bFieldSpec==false && m_iFieldMaxPos==0 && m_bZoneSpan==false && m_dZones.GetLength()==0;
 	}
 
 	XQLimitSpec_t ( const XQLimitSpec_t& dLimit )

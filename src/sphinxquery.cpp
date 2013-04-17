@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2012, Andrew Aksyonoff
-// Copyright (c) 2008-2012, Sphinx Technologies Inc
+// Copyright (c) 2001-2013, Andrew Aksyonoff
+// Copyright (c) 2008-2013, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -903,6 +903,12 @@ int XQParser_t::GetToken ( YYSTYPE * lvalp )
 				} else
 				{
 					// got stray '<', ignore
+					if ( m_iPendingNulls>0 )
+					{
+						m_iPendingNulls = 0;
+						lvalp->pNode = AddKeyword ( NULL );
+						return TOK_KEYWORD;
+					}
 					continue;
 				}
 			} else
@@ -1226,12 +1232,7 @@ static bool CheckQuorumProximity ( XQNode_t * pNode, CSphString * pError )
 		return false;
 	}
 
-	bool bValid = true;
-	ARRAY_FOREACH_COND ( i, pNode->m_dChildren, bValid )
-	{
-		bValid &= CheckQuorumProximity ( pNode->m_dChildren[i], pError );
-	}
-
+	bool bValid = ARRAY_ALL ( bValid, pNode->m_dChildren, CheckQuorumProximity ( pNode->m_dChildren[_all], pError ) );
 	return bValid;
 }
 
